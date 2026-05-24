@@ -1,0 +1,19 @@
+name: failover_dio
+description: A drop-in replacement for the dio HTTP client that adds DNS-aware IP fail-over, latency-based routing, TTL-driven cache refresh, and observability headers — without requiring any caller-side code changes.
+version: 0.1.0
+repository: https://github.com/fl-start/failover_dio
+issue_tracker: https://github.com/fl-start/failover_dio/issues
+
+environment:
+  sdk: ^3.5.0
+
+dependencies:
+  dio: ^5.7.0
+  dio_web_adapter: ^2.1.0
+  meta: ^1.16.0
+  collection: ^1.19.0
+  crypto: ^3.0.6
+
+dev_dependencies:
+  test: ^1.25.15
+  lints: ^5.1.1
