@@ -31,6 +31,14 @@ Future<void> main() async {
         print('cache evicted ${e.host} (${e.reason})');
       case RequestExhausted():
         print('REQUEST EXHAUSTED ${e.host} after ${e.attempts.length} attempts');
+      case WebSocketConnected():
+        print('ws connected ${e.host} @ ${e.ip}');
+      case WebSocketReconnecting():
+        print('ws reconnecting ${e.host} @ ${e.ip} (${e.phase})');
+      case WebSocketReconnected():
+        print('ws reconnected ${e.host} @ ${e.ip} (${e.phase})');
+      case WebSocketReconnectFailed():
+        print('ws reconnect failed ${e.host} @ ${e.ip}: ${e.error}');
     }
   });
 

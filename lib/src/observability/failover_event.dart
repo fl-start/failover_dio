@@ -239,3 +239,76 @@ final class RequestExhausted extends FailoverEvent {
   /// The idempotency key that was used across all attempts.
   final String idempotencyKey;
 }
+
+/// WebSocket successfully connected on [ip].
+final class WebSocketConnected extends FailoverEvent {
+  /// Creates the event.
+  WebSocketConnected({required this.host, required this.ip});
+
+  /// Normalized hostname.
+  final String host;
+
+  /// Connected IP.
+  final String ip;
+}
+
+/// WebSocket reconnect attempt started.
+final class WebSocketReconnecting extends FailoverEvent {
+  /// Creates the event.
+  WebSocketReconnecting({
+    required this.host,
+    required this.ip,
+    required this.phase,
+  });
+
+  /// Normalized hostname.
+  final String host;
+
+  /// IP being reconnected to.
+  final String ip;
+
+  /// `send`, `manual`, `reconnect-same`, or `reconnect-next`.
+  final String phase;
+}
+
+/// WebSocket reconnect succeeded.
+final class WebSocketReconnected extends FailoverEvent {
+  /// Creates the event.
+  WebSocketReconnected({
+    required this.host,
+    required this.ip,
+    required this.phase,
+  });
+
+  /// Normalized hostname.
+  final String host;
+
+  /// New active IP.
+  final String ip;
+
+  /// Reconnect phase label.
+  final String phase;
+}
+
+/// WebSocket reconnect attempt failed.
+final class WebSocketReconnectFailed extends FailoverEvent {
+  /// Creates the event.
+  WebSocketReconnectFailed({
+    required this.host,
+    required this.ip,
+    required this.error,
+    required this.phase,
+  });
+
+  /// Normalized hostname.
+  final String host;
+
+  /// IP that failed.
+  final String ip;
+
+  /// Failure reason.
+  final Object error;
+
+  /// Reconnect phase label.
+  final String phase;
+}

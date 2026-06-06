@@ -48,3 +48,4 @@ export 'src/util/console_failover_logger.dart';
 export 'src/util/hostname_normalizer.dart';
 export 'src/util/idempotency_key_generator.dart';
 export 'src/util/metrics.dart';
+export 'src/websocket/websocket_export.dart';

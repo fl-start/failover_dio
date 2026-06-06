@@ -12,6 +12,7 @@ import '../observability/cache_inspector.dart';
 import '../observability/failover_event.dart';
 import '../util/hostname_normalizer.dart';
 import '../util/metrics.dart';
+import '../websocket/websocket_export.dart';
 
 /// Drop-in replacement for `dio.Dio` that installs the
 /// [FailoverHttpClientAdapter] in its constructor.
@@ -43,6 +44,24 @@ class Dio extends dio_io.DioForNative {
 class FailoverDio extends Dio {
   /// Creates a [FailoverDio].
   FailoverDio({super.options, super.failoverOptions});
+
+  /// Opens a WebSocket with DNS-aware connect + reconnect failover.
+  ///
+  /// Delegates to [FailoverWebSocket.connect] using this client's
+  /// [failoverAdapter] cache when [failoverOptions.useSharedCache] is true.
+  static Future<FailoverWebSocket> connectWebSocket(
+    String url, {
+    FailoverOptions? failoverOptions,
+    Iterable<String>? protocols,
+    Map<String, String>? headers,
+  }) {
+    return FailoverWebSocket.connect(
+      url,
+      failoverOptions: failoverOptions,
+      protocols: protocols,
+      headers: headers,
+    );
+  }
 
   /// Wipes the entire shared cache, or only [host] if supplied.
   static void clearHostCache([String? host]) {

@@ -555,6 +555,28 @@ Runnable scripts live under `example/`:
 | `custom_resolver_doh.dart` | Plug in a custom `DnsResolver` |
 | `per_host_overrides.dart` | Different timeouts/probing per host |
 
+### WebSocket failover
+
+For long-lived `ws://` connections to DNS-published gateway fleets (mirroring curl_fo's `cf_ws_connect`):
+
+```dart
+import 'package:failover_dio/failover_dio.dart';
+
+final ws = await FailoverWebSocket.connect(
+  'ws://api.example.com/v1/stream',
+  failoverOptions: FailoverOptions(onEvent: FailoverDio.eventSink),
+);
+
+ws.stream.listen((msg) => print('← $msg'));
+await ws.send('hello');
+
+// On transport failure, [send] and [reconnect] apply curl_fo policy:
+// retry the same IP once, then the next ranked IP.
+await ws.reconnect();
+```
+
+`wss://` connects via stock `WebSocket.connect` (no per-IP pinning in v0.1; see [Limitations](#limitations)).
+
 Run any of them with:
 
 ```bash
@@ -570,6 +592,7 @@ dart run example/simple_get.dart
 | Drop-in API | yes | yes | yes | yes |
 | Multiple A/AAAA records used | no | partial (engine-internal) | hard to do correctly | **yes (explicit)** |
 | Happy Eyeballs TCP latency racing | no | no | no | **yes** |
+| WebSocket connect + reconnect failover | no | no | manual | **yes (`ws://`)** |
 | Staggered in-flight fail-over | no | no | usually sequential | **yes (original wins late)** |
 | Per-method timeouts | no | no | yes | **yes** |
 | Idempotency / observability headers | no | no | manual | **yes (automatic)** |
@@ -608,7 +631,7 @@ A: Use `useSharedCache: false`, supply a `FakeDnsResolver` and `FakeClock` from 
 
 ## Limitations
 
-- **HTTPS (v0.1)** falls back to stock Dio (no per-IP failover). `dart:io`'s `HttpClient.connectionFactory` does not auto-upgrade the returned socket to TLS, and `ConnectionTask` is a `final` class with invariant generics, so a `SecureSocket`-yielding `ConnectionTask<Socket>` cannot be constructed cleanly. v0.2 adds a custom HTTP/1.1 transport that performs the TLS handshake directly (preserving SNI on the URL host) to lift this restriction.
+- **HTTPS / WSS (v0.1)** fall back to stock Dio / `WebSocket.connect` (no per-IP failover). `dart:io`'s `HttpClient.connectionFactory` does not auto-upgrade the returned socket to TLS, and `ConnectionTask` is a `final` class with invariant generics, so a `SecureSocket`-yielding `ConnectionTask<Socket>` cannot be constructed cleanly. v0.2 adds a custom HTTP/1.1 transport that performs the TLS handshake directly (preserving SNI on the URL host) to lift this restriction.
 - **Web** uses stock Dio (no failover).
 - **Replacing `httpClientAdapter`** after construction disables failover (same as any custom adapter).
 - **Latency measurement uses parallel TCP connects** (Happy Eyeballs), not ICMP ping (ICMP isn't cross-platform in Dart).
