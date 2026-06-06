@@ -9,6 +9,10 @@ enum AttemptOutcome {
   /// Attempt was aborted because another attempt won the race.
   abortedByWinner,
 
+  /// TCP connect attempt was cancelled after a peer won the parallel
+  /// Happy Eyeballs connect race (SYN+ACK on another IP).
+  abortedByConnectRace,
+
   /// Attempt was aborted because the caller cancelled the request.
   abortedByCancel,
 

@@ -49,7 +49,7 @@ In this architecture:
 - **Clients are expected to fail over on their own.** When one gateway IP times out, hangs, or returns a connection-level error, the client should immediately try the next IP rather than wait for DNS TTL expiry, BGP convergence, or operator intervention.
 - **The first successful response wins.** Stateful operations idempotently dedupe via a stable per-request key so retries during fail-over don't double-spend, double-charge, or double-write.
 
-Stock Dio (and most HTTP clients) picks one IP per hostname and keeps using it until the OS resolver expires it. That's fine for a single-VIP setup; it leaves serious resilience on the table for a DNS-published gateway fleet. `failover_dio` is the missing client-side piece: every Dio request becomes a coordinated walk over the gateway IPs, with latency-aware ordering, staggered in-flight fail-over, idempotency-key continuity, and structured observability — without changing a line of caller code.
+Stock Dio (and most HTTP clients) picks one IP per hostname and keeps using it until the OS resolver expires it. That's fine for a single-VIP setup; it leaves serious resilience on the table for a DNS-published gateway fleet. `failover_dio` is the missing client-side piece: every Dio request becomes a parallel TCP Happy Eyeballs wave over the gateway IPs, with latency-aware ordering, idempotency-key continuity, and structured observability — without changing a line of caller code.
 
 > **Not the right fit if** your traffic terminates at a single VIP / cloud load-balancer that already does fleet-level health checking (ALB, GCLB, Cloud Front, Cloudflare). Stock Dio is enough there. `failover_dio` shines when *DNS itself* is your load balancer.
 
@@ -90,13 +90,12 @@ In a DNS-as-load-balancer gateway fleet, **the client is the load balancer**. St
 `failover_dio` keeps the `dio.Dio` API exactly the same but transparently:
 
 - Resolves every `A` and `AAAA` record for the gateway hostname (the full fleet roster).
-- Sends the first request to the first resolved IP **immediately** — no probe wait, no warm-up.
-- Runs background TCP-connect latency probes when more than one gateway IP is known and sorts subsequent attempts by ascending latency, so clients gravitate toward the nearest / least-loaded pod.
-- On per-IP timeout, **starts a new attempt to the next gateway IP while the first one stays in flight** (staggered fail-over). The first successful response wins; the loser is aborted.
+- On each request wave, races up to **`maxIpAttempts` parallel TCP connects** (Happy Eyeballs) — first SYN+ACK wins, losers are cancelled (RST), and **exactly one** HTTP exchange runs on the winner. Every connect completion immediately updates the latency-sorted cache.
+- If a wave produces no TCP winner, launches the next wave from remaining DNS entries until one succeeds or the roster is exhausted.
 - Respects each record's TTL, refreshes lazily on access, and supports stale-while-revalidate so a brief authoritative-DNS outage doesn't take the client offline.
 - Marks failing gateway IPs unavailable with exponential cooldown — a flapping pod gets temporarily evicted from the client's rotation without ever touching DNS.
 - Injects `failover_dio_idempotency_key` (stable across attempts on the same logical request) and `failover_dio_previous_ip` so the gateway can dedupe at-least-once retries against its stateful backends.
-- Caps the total number of distinct gateway IPs tried per request (default 3) and the overall request duration (default 30s).
+- Caps parallel connect fan-out per wave at `maxIpAttempts` (default 3) and the overall request duration (default 30s).
 - Exposes a typed `FailoverEvent` stream, per-request `Response.extra` metadata, and a cache inspector for SRE-grade observability.
 - Falls through to a **zero-overhead path identical to stock Dio** whenever DNS returns only one IP (single-pod dev environments, blue/green cut-overs, manual pinning) — see [Single-IP fast path](#single-ip-fast-path-zero-overhead-drop-in-for-single-record-hosts).
 
@@ -112,30 +111,43 @@ caller ─▶ Dio (api unchanged) ─▶ FailoverHttpClientAdapter
                                        │
                                        ├─ DnsResolver (pluggable: platform / DoH / custom)
                                        │
-                                       ├─ ProbeScheduler (TCP-connect probes; deduplicated; budgeted)
+                                       ├─ ProbeScheduler (warmup-only TCP races)
                                        │
-                                       └─ FailoverRequestCoordinator (per request)
+                                       └─ HappyEyeballsCoordinator (per request)
                                            ├─ buffers body per BodyReplayPolicy
-                                           ├─ runs attempt 1 immediately
-                                           ├─ starts attempt 2 on per-method timeout
-                                           │   while attempt 1 stays in flight
-                                           ├─ first successful response wins
-                                           └─ aborts losers and bumps caches
+                                           ├─ parallel TCP connect wave (maxIpAttempts)
+                                           ├─ first SYN+ACK wins; RST on losers
+                                           ├─ single HTTP exchange on winner
+                                           └─ next wave if TCP or HTTP fails
 ```
 
-### Staggered fail-over sequence
+### Parallel TCP Happy Eyeballs (per request wave)
+
+When DNS returns more than one gateway IP, each request wave runs parallel TCP connects — **not** duplicate HTTP bodies:
 
 ```text
-Adapter ──▶ IP₁  (attempt 1)
-            ⏱ getConnectTimeout elapses (e.g. 3s)
-Adapter ──▶ IP₂  (attempt 2; IP₁ still in flight)
-            either:
-                IP₁ responds  ─▶ accept IP₁, abort IP₂
-                IP₂ responds first ─▶ accept IP₂, abort IP₁
-            on hard TCP error (RST / refused / TLS)
-                ─▶ start next IP immediately (no wait)
-            after maxIpAttempts distinct IPs ─▶ DioException.connectionTimeout
+DNS resolve api.example.com → [IP₁, IP₂, IP₃, IP₄, IP₅]
+
+Wave 1 (maxIpAttempts = 3):
+  TCP SYN ──▶ IP₁  ────────────────▶ 180ms  (order=2) ──▶ cache reorder
+  TCP SYN ──▶ IP₂  ──▶ 12ms  (order=0) ──▶ cache reorder  ◀── SYN+ACK winner
+  TCP SYN ──▶ IP₃  ──────▶ 45ms  (order=1) ──▶ cache reorder
+            IP₁, IP₃ cancelled (RST) after IP₂ wins
+            single HTTP GET ──▶ IP₂ only
+
+Wave 2 (only if wave 1 had no SYN+ACK or HTTP failed):
+  TCP SYN ──▶ IP₄, IP₅ ...
 ```
+
+Key properties:
+
+- **Up to `maxIpAttempts` parallel SYNs per wave** — not one SYN per DNS record at once.
+- **First SYN+ACK wins** — losers are cancelled via `ConnectionTask.cancel()` (RST).
+- **Exactly one HTTP request** per logical call — safe for non-idempotent POST/PUT.
+- **Each TCP completion updates cache sort order** immediately, including background completions after the winner is chosen.
+- **Warmup API** (`FailoverDio.warmup`) still uses `ProbeScheduler` for probe-only races without HTTP.
+
+This is TCP connect time measurement, not ICMP ping — it works on every `dart:io` platform and approximates the real cost of reaching each gateway pod.
 
 ---
 
@@ -253,13 +265,13 @@ final dio = Dio(
 
 | Group | Field | Default | Description |
 |---|---|---|---|
-| Timeouts | `getConnectTimeout` | 3s | Per-IP fail-over trigger for `GET`/`HEAD` |
-| | `defaultConnectTimeout` | 8s | Per-IP fail-over trigger for everything else |
+| Timeouts | `getConnectTimeout` | 3s | Passed through to Dio `Options.connectTimeout` for `GET`/`HEAD` |
+| | `defaultConnectTimeout` | 8s | Passed through to Dio `Options.connectTimeout` for other methods |
 | | `overallTimeout` | 30s | Hard ceiling for the whole logical request |
 | | `probeTimeout` | 2s | Per-IP latency probe timeout |
 | | `dnsLookupTimeout` | 5s | DNS resolver timeout |
 | | `negativeCacheTtl` | 15s | Cache negative lookups for this long |
-| Attempts | `maxIpAttempts` | 3 | Max distinct IPs tried before failing |
+| Attempts | `maxIpAttempts` | 3 | Parallel TCP SYN fan-out per wave |
 | | `unavailableCooldownInitial` | 60s | Initial cooldown on IP failure |
 | | `unavailableCooldownMax` | 15m | Max cooldown after repeated failures |
 | | `unavailableCooldownFactor` | 2.0 | Exponential multiplier per consecutive failure |
@@ -267,9 +279,9 @@ final dio = Dio(
 | | `maxCachedHosts` | 256 | LRU cap |
 | | `staleWhileRevalidate` | `true` | Serve stale cache while refreshing |
 | | `maxStaleAge` | 60s | Hard cap on staleness |
-| Probing | `enableLatencyProbe` | `true` | Run TCP-connect probes when A count > 1 |
+| Probing | `enableLatencyProbe` | `true` | Run Happy Eyeballs parallel TCP races when A count > 1 |
 | | `probeFreshness` | 30s | Skip re-probes within this window |
-| | `maxConcurrentProbes` | 4 | Probe budget across all hosts |
+| | `maxConcurrentProbes` | 4 | Reserved (all eligible IPs per host race in parallel) |
 | Headers | `enableFailoverHeaders` | `true` | Inject `failover_dio_*` headers |
 | | `idempotencyKeyGenerator` | `SecureRandomIdempotencyKeyGenerator()` | Source of idempotency keys |
 | Fast path | `singleIpFastPath` | `true` | When DNS returns one IP, behave exactly like stock Dio (see below) |
@@ -339,7 +351,7 @@ If DNS resolves a host to **exactly one** usable IP, there is nothing to fail ov
 | `FailoverEvent`s (`AttemptStarted`, `AttemptSucceeded`, ...) | **not emitted** | emitted |
 | `Response.extra` metadata (`winningIp`, `idempotencyKey`, `totalMs`, `attempts`) | **not populated** | populated |
 | Per-request `Stopwatch` / `Completer` / `Timer` allocations | **none** | allocated |
-| Latency probes | skipped (always — needs ≥2 IPs) | scheduled |
+| Happy Eyeballs TCP races | skipped (always — needs ≥2 IPs) | parallel; HTTP after first arrival |
 | DNS lookups | **one** (our resolver, cached after first call) | one (our resolver, cached after first call) |
 
 Cache-layer events such as `HostResolved`, `CacheRefreshed`, `IpMarkedUnavailable`, and `CacheEvicted` still fire because those describe the cache, not the request.
@@ -442,7 +454,7 @@ The default logger is `NoOpFailoverLogger` in release and `ConsoleFailoverLogger
 ## Robustness
 
 - **Single-flight DNS coalescing** — concurrent first requests to the same cold host share one DNS lookup.
-- **Hard-error fast path** — TCP RST/ECONNREFUSED/TLS errors skip the stagger wait and trigger the next IP immediately.
+- **Hard-error fast path** — TCP RST/ECONNREFUSED/TLS errors in a wave advance to the next wave without waiting for slow peers.
 - **Overall request deadline** — bounds the total time a logical request can take.
 - **DNS answer validation** — rejects `0.0.0.0`, link-local, multicast/broadcast, and (configurably) loopback or private addresses for public hosts (SSRF defense).
 - **Bounded LRU cache** — caps memory at `maxCachedHosts` (default 256); pending probes for evicted hosts are cancelled.
@@ -559,7 +571,7 @@ dart run example/simple_get.dart
 |---|---|---|---|---|
 | Drop-in API | yes | yes | yes | yes |
 | Multiple A/AAAA records used | no | partial (engine-internal) | hard to do correctly | **yes (explicit)** |
-| Per-IP latency probing | no | no | no | **yes** |
+| Happy Eyeballs TCP latency racing | no | no | no | **yes** |
 | Staggered in-flight fail-over | no | no | usually sequential | **yes (original wins late)** |
 | Per-method timeouts | no | no | yes | **yes** |
 | Idempotency / observability headers | no | no | manual | **yes (automatic)** |
@@ -601,7 +613,7 @@ A: Use `useSharedCache: false`, supply a `FakeDnsResolver` and `FakeClock` from 
 - **HTTPS (v0.1)** falls back to stock Dio (no per-IP failover). `dart:io`'s `HttpClient.connectionFactory` does not auto-upgrade the returned socket to TLS, and `ConnectionTask` is a `final` class with invariant generics, so a `SecureSocket`-yielding `ConnectionTask<Socket>` cannot be constructed cleanly. v0.2 adds a custom HTTP/1.1 transport that performs the TLS handshake directly (preserving SNI on the URL host) to lift this restriction.
 - **Web** uses stock Dio (no failover).
 - **Replacing `httpClientAdapter`** after construction disables failover (same as any custom adapter).
-- **Latency probes are TCP-connect**, not ICMP (ICMP isn't cross-platform in Dart).
+- **Latency measurement uses parallel TCP connects** (Happy Eyeballs), not ICMP ping (ICMP isn't cross-platform in Dart).
 - **HTTP/2 and HTTP/3** require `native_dio_adapter` and are incompatible with this library's per-IP pinning.
 - **DoH resolver** is an abstract interface in v0.1; the built-in `DohResolver` is a stub. Bring your own resolver or wait for the built-in.
 - **Certificate pin enforcement** is a stub in v0.1; the configuration API is final, and enforcement will land in a follow-up release without API changes.

@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - `FailoverOptions.singleIpFastPath` (default `true`) and matching `HostOverride.singleIpFastPath`. When DNS resolves to exactly one usable IP for a host, the request is issued through the pinned adapter for that IP with **no** body buffering, **no** `failover_dio_*` headers, **no** `FailoverEvent`s, and **no** `Response.extra` metadata — wire-indistinguishable from stock Dio. Set to `false` to keep the full instrumentation regardless of IP cardinality.
+- **Happy Eyeballs parallel TCP-connect latency racing** replaces sequential per-IP probing. All resolved IPs are measured concurrently; each completion immediately reorders the cache; HTTP proceeds after the first connect finishes without waiting for slower peers. `LatencyProbed.completionOrder` reports finish order (0 = first arrival).
+
+### Changed
+- **Breaking:** Multi-IP HTTP failover now uses **parallel TCP Happy Eyeballs connect racing** instead of staggered sequential attempts. Each wave sends up to `maxIpAttempts` concurrent SYNs; the first SYN+ACK wins; losers are RST-cancelled; exactly one HTTP exchange runs on the winner. Waves continue until success or DNS roster exhaustion.
+- `maxIpAttempts` now means **parallel connect fan-out per wave** (not a sequential attempt cap).
+- Request-time connect races populate the latency cache; the pre-HTTP `ProbeScheduler.raceHappyEyeballs` hot-path call was removed (`ProbeScheduler` remains for warmup).
+- Removed unused `FailoverOptions.maxConcurrentAttemptsPerRequest` (folded into `maxIpAttempts`).
+- Added `AttemptOutcome.abortedByConnectRace` for TCP peers cancelled after a parallel connect winner.
 
 ## [0.1.0] - 2026-05-24
 

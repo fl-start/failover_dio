@@ -5,6 +5,10 @@ import 'latency_probe.dart';
 
 /// Default latency probe that times a single TCP connect to [InternetAddress].
 ///
+/// Used as the per-IP worker inside [HappyEyeballsProbe], which races all
+/// resolved IPs in parallel and promotes faster arrivals to the top of the
+/// candidate list without waiting for the full roster.
+///
 /// Pros: works on every Dart platform that supports `dart:io Socket`;
 /// approximates real connect cost.
 /// Cons: not actual application-layer RTT.

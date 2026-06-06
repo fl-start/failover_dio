@@ -46,7 +46,6 @@ class FailoverOptions {
     this.allowPrivateAddresses = true,
     this.dnsLocalHosts = const <String>{'localhost'},
     CertificatePinner? certificatePinner,
-    this.maxConcurrentAttemptsPerRequest = 2,
     this.onEvent,
     FailoverLogger? logger,
     this.debugSlowRequestThreshold = const Duration(seconds: 2),
@@ -79,7 +78,13 @@ class FailoverOptions {
   /// Hard ceiling for the whole logical request (default 30s).
   final Duration overallTimeout;
 
-  /// Maximum distinct IPs to try before failing (default 3).
+  /// Parallel TCP connect fan-out per Happy Eyeballs wave (default 3).
+  ///
+  /// On each wave, up to this many gateway IPs receive concurrent
+  /// `Socket.startConnect` calls; the first SYN+ACK wins and receives the
+  /// single HTTP exchange. If the wave produces no winner, the next wave
+  /// takes the next slice of resolved addresses until one succeeds or the
+  /// DNS roster is exhausted.
   final int maxIpAttempts;
 
   /// Initial cooldown when marking an IP unavailable (default 60s).
@@ -91,7 +96,7 @@ class FailoverOptions {
   /// Cooldown multiplier per consecutive failure (default 2.0).
   final double unavailableCooldownFactor;
 
-  /// Per-IP TCP-connect probe timeout (default 2s).
+  /// Per-IP TCP connect timeout inside a Happy Eyeballs wave (default 2s).
   final Duration probeTimeout;
 
   /// Per-host DNS lookup timeout (default 5s).
@@ -108,13 +113,17 @@ class FailoverOptions {
   /// Maximum hosts before LRU eviction (default 256).
   final int maxCachedHosts;
 
-  /// Run TCP-connect latency probes when A count > 1 (default `true`).
+  /// Run parallel TCP Happy Eyeballs connect races on each request wave
+  /// (default `true`). When `false`, each wave issues HTTP to the first
+  /// DNS-ordered IP without a connect race (warmup still uses probes).
   final bool enableLatencyProbe;
 
   /// Minimum interval between probes for the same IP (default 30s).
   final Duration probeFreshness;
 
-  /// Cap on concurrent probe sockets across all hosts (default 4).
+  /// Reserved for future cross-host probe budgeting. Within a single host,
+  /// Happy Eyeballs races **all** eligible IPs in parallel regardless of
+  /// this value.
   final int maxConcurrentProbes;
 
   /// Serve stale cache entries while refreshing (default `true`).
@@ -171,11 +180,6 @@ class FailoverOptions {
 
   /// Certificate pin configuration (no enforcement in v0.1).
   final CertificatePinner certificatePinner;
-
-  // ===== Concurrency =====
-
-  /// Maximum concurrent attempts per logical request (Phase 1 fixed at 2).
-  final int maxConcurrentAttemptsPerRequest;
 
   // ===== Observability =====
 
@@ -278,7 +282,6 @@ class FailoverOptions {
     bool? allowPrivateAddresses,
     Set<String>? dnsLocalHosts,
     CertificatePinner? certificatePinner,
-    int? maxConcurrentAttemptsPerRequest,
     void Function(FailoverEvent)? onEvent,
     FailoverLogger? logger,
     Duration? debugSlowRequestThreshold,
@@ -323,8 +326,6 @@ class FailoverOptions {
           allowPrivateAddresses ?? this.allowPrivateAddresses,
       dnsLocalHosts: dnsLocalHosts ?? this.dnsLocalHosts,
       certificatePinner: certificatePinner ?? this.certificatePinner,
-      maxConcurrentAttemptsPerRequest: maxConcurrentAttemptsPerRequest ??
-          this.maxConcurrentAttemptsPerRequest,
       onEvent: onEvent ?? this.onEvent,
       logger: logger ?? this.logger,
       debugSlowRequestThreshold:

@@ -1,5 +1,6 @@
 /// `failover_dio` — a drop-in `dio` replacement with DNS-aware IP failover,
-/// staggered in-flight retries, latency-based routing, TTL-driven cache
+/// parallel TCP Happy Eyeballs connect racing, latency-based routing,
+/// TTL-driven cache
 /// refresh, and observability headers.
 ///
 /// **Migration**: change

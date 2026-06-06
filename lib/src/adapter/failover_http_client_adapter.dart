@@ -15,6 +15,7 @@ import '../errors/failover_exhausted_error.dart';
 import '../latency/latency_probe.dart';
 import '../latency/probe_scheduler.dart';
 import '../latency/tcp_connect_probe.dart';
+import 'happy_eyeballs_connect_race.dart';
 import '../observability/attempt_record.dart';
 import '../observability/failover_event.dart';
 import '../observability/failover_logger.dart';
@@ -23,9 +24,9 @@ import '../util/hostname_normalizer.dart';
 import '../util/metrics.dart';
 import '../util/timeline.dart';
 
-/// `HttpClientAdapter` that adds DNS-aware IP failover, staggered in-flight
-/// retries, idempotency/observability headers, and CancelToken-aware
-/// orchestration on top of Dio's standard transport.
+/// `HttpClientAdapter` that adds DNS-aware IP failover, parallel TCP Happy
+/// Eyeballs connect racing, idempotency/observability headers, and
+/// CancelToken-aware orchestration on top of Dio's standard transport.
 ///
 /// Constructed once per `Dio` instance via the failover `Dio` subclass.
 class FailoverHttpClientAdapter implements HttpClientAdapter {
@@ -171,17 +172,10 @@ class FailoverHttpClientAdapter implements HttpClientAdapter {
     final Uint8List? bodyBytes = bodyResult.bytes;
     final bool singleAttemptOnly = bodyResult.singleAttempt;
 
-    // Trigger background probes (only when more than one IP is known).
-    if (_options.enableLatencyProbeFor(host)) {
-      _probeScheduler.maybeProbeAll(host, port: port);
-    }
-
-    final int maxAttempts =
+    final int parallelWidth =
         _resolveMaxIpAttempts(options, host, singleAttemptOnly);
-    final List<IpEntry> ordered = _cache.orderedEntries(host);
-    final List<IpEntry> candidates =
-        ordered.take(maxAttempts).toList(growable: false);
-    if (candidates.isEmpty) {
+    final List<IpEntry> allEntries = _cache.orderedEntries(host);
+    if (allEntries.isEmpty) {
       throw DioException(
         requestOptions: options,
         type: DioExceptionType.connectionError,
@@ -189,14 +183,14 @@ class FailoverHttpClientAdapter implements HttpClientAdapter {
       );
     }
 
-    return _runCoordinator(
+    return _runHappyEyeballsCoordinator(
       requestOptions: options,
-      candidates: candidates,
+      allEntries: allEntries,
       bodyBytes: bodyBytes,
       cancelFuture: cancelFuture,
       host: host,
       port: port,
-      maxAttempts: maxAttempts,
+      parallelWidth: parallelWidth,
     );
   }
 
@@ -304,17 +298,6 @@ class FailoverHttpClientAdapter implements HttpClientAdapter {
     return _options.maxIpAttemptsFor(host);
   }
 
-  Duration _methodFailoverTimeout(RequestOptions options, String host) {
-    // Per-request override via Dio's Options.connectTimeout wins.
-    final Duration? perReq = options.connectTimeout;
-    if (perReq != null) return perReq;
-    final String m = options.method.toUpperCase();
-    if (m == 'GET' || m == 'HEAD') {
-      return _options.getConnectTimeoutFor(host);
-    }
-    return _options.defaultConnectTimeoutFor(host);
-  }
-
   Duration _overallDeadline(RequestOptions options, String host) {
     final Object? perReq = options.extra[FailoverExtraKeys.overallTimeout];
     if (perReq is Duration) return perReq;
@@ -363,280 +346,349 @@ class FailoverHttpClientAdapter implements HttpClientAdapter {
     }
   }
 
-  Future<ResponseBody> _runCoordinator({
+  Future<ResponseBody> _runHappyEyeballsCoordinator({
     required RequestOptions requestOptions,
-    required List<IpEntry> candidates,
+    required List<IpEntry> allEntries,
     required Uint8List? bodyBytes,
     required Future<void>? cancelFuture,
     required String host,
     required int port,
-    required int maxAttempts,
+    required int parallelWidth,
   }) async {
     final String idempotencyKey =
         _options.idempotencyKeyGenerator.generate();
     final Stopwatch overall = Stopwatch()..start();
     final List<AttemptRecord> records = <AttemptRecord>[];
-    final Completer<ResponseBody> winner = Completer<ResponseBody>();
-    final List<_AttemptState> attempts = <_AttemptState>[];
-    int nextIndex = 0;
+    final bool probeEnabled = _options.enableLatencyProbeFor(host);
+    const HappyEyeballsConnectRace connectRace = HappyEyeballsConnectRace();
+
+    List<IpEntry> remaining = List<IpEntry>.of(allEntries);
+    int waveIndex = 0;
+    String? previousIp;
     String? lastTriedIp;
 
-    Timer? failoverTimer;
+    final Completer<void> httpAbort = Completer<void>();
     Timer? overallTimer;
     StreamSubscription<void>? cancelSub;
+    bool cancelled = false;
 
-    void cancelTimers() {
-      failoverTimer?.cancel();
-      failoverTimer = null;
+    final Future<void> connectAbort = cancelFuture == null
+        ? httpAbort.future
+        : Future.any<void>(<Future<void>>[cancelFuture, httpAbort.future]);
+
+    void cancelOverallTimer() {
       overallTimer?.cancel();
       overallTimer = null;
     }
 
-    Future<void> abortAll(AttemptOutcome reason) async {
-      for (final _AttemptState a in attempts) {
-        if (!a.aborted && !a.completed) {
-          a.aborted = true;
-          if (!a.abortCompleter.isCompleted) {
-            a.abortCompleter.complete();
-          }
-          _emit(AttemptAborted(
-            host: host,
-            ip: a.ip.addressString,
-            attemptIndex: a.index,
-            reason: reason,
-          ));
-        }
-      }
-    }
-
-    void startNextAttempt() {
-      if (winner.isCompleted) return;
-      if (nextIndex >= candidates.length) return;
-      final IpEntry ip = candidates[nextIndex];
-      final int idx = nextIndex;
-      nextIndex++;
-
-      if (idx > 0) FailoverMetrics.instance.incFailovers();
-
-      final _AttemptState state = _AttemptState(idx, ip);
-      attempts.add(state);
-
-      final String? prevIp = lastTriedIp;
-      lastTriedIp = ip.addressString;
-
-      _emit(AttemptStarted(
-        host: host,
-        ip: ip.addressString,
-        attemptIndex: idx,
-        idempotencyKey: idempotencyKey,
-        previousIp: prevIp,
-      ));
-      _options.logger.log(FailoverLogLevel.debug, 'attempt_started',
-          fields: <String, Object?>{
-            'host': host,
-            'ip': ip.addressString,
-            'attempt': idx,
-            'idem': idempotencyKey,
-            if (prevIp != null) 'previousIp': prevIp,
-          });
-
-      final RequestOptions cloned = _cloneWithHeaders(
-        requestOptions,
-        idempotencyKey: idempotencyKey,
-        previousIp: prevIp,
-        host: host,
-      );
-      final Stream<Uint8List>? freshBody = bodyBytes == null
-          ? null
-          : Stream<Uint8List>.fromIterable(<Uint8List>[bodyBytes]);
-      final IOHttpClientAdapter adapter = _pinnedAdapterFor(host, ip.address);
-      // HttpClient connection pooling already coalesces concurrent attempts
-      // to the same (host, ip); singleflight is reserved for future use.
-      final Future<ResponseBody> attemptFuture =
-          adapter.fetch(cloned, freshBody, state.abortCompleter.future);
-
-      attemptFuture.then((ResponseBody body) {
-        state.completed = true;
-        state.sw.stop();
-        if (winner.isCompleted) {
-          // Stale; record as aborted-by-winner and tear down.
-          records.add(AttemptRecord(
-            attemptIndex: idx,
-            ip: ip.addressString,
-            outcome: AttemptOutcome.abortedByWinner,
-            durationMs: state.sw.elapsedMilliseconds,
-            statusCode: body.statusCode,
-          ));
-          if (!state.abortCompleter.isCompleted) state.abortCompleter.complete();
-          return;
-        }
-        records.add(AttemptRecord(
-          attemptIndex: idx,
-          ip: ip.addressString,
-          outcome: AttemptOutcome.succeeded,
-          durationMs: state.sw.elapsedMilliseconds,
-          statusCode: body.statusCode,
-        ));
-        _emit(AttemptSucceeded(
-          host: host,
-          ip: ip.addressString,
-          attemptIndex: idx,
-          statusCode: body.statusCode,
-          durationMs: state.sw.elapsedMilliseconds,
-        ));
-        _options.logger.log(FailoverLogLevel.info, 'attempt_succeeded',
-            fields: <String, Object?>{
-              'host': host,
-              'ip': ip.addressString,
-              'attempt': idx,
-              'status': body.statusCode,
-              'ms': state.sw.elapsedMilliseconds,
-            });
-        _cache.markAvailable(host, ip.address);
-
-        overall.stop();
-        // Synthesize aborted-by-winner records for any in-flight loser
-        // so the response carries a complete attempt picture.
-        for (final _AttemptState a in attempts) {
-          if (a.index == idx) continue;
-          if (a.completed || a.aborted) continue;
-          records.add(AttemptRecord(
-            attemptIndex: a.index,
-            ip: a.ip.addressString,
-            outcome: AttemptOutcome.abortedByWinner,
-            durationMs: a.sw.elapsedMilliseconds,
-          ));
-        }
-        final List<AttemptRecord> sortedRecords =
-            List<AttemptRecord>.of(records)
-              ..sort((AttemptRecord a, AttemptRecord b) =>
-                  a.attemptIndex.compareTo(b.attemptIndex));
-        _annotateResponse(
-          body,
-          host: host,
-          ip: ip.addressString,
-          attempts: List<AttemptRecord>.unmodifiable(sortedRecords),
-          idempotencyKey: idempotencyKey,
-          totalMs: overall.elapsedMilliseconds,
-        );
-        winner.complete(body);
-        cancelTimers();
-        // Fire-and-forget abort of other attempts.
-        unawaited(abortAll(AttemptOutcome.abortedByWinner));
-      }).catchError((Object error, StackTrace stack) {
-        state.completed = true;
-        state.sw.stop();
-        final bool hardError = _isHardError(error);
-        records.add(AttemptRecord(
-          attemptIndex: idx,
-          ip: ip.addressString,
-          outcome: state.aborted
-              ? AttemptOutcome.abortedByWinner
-              : AttemptOutcome.failed,
-          durationMs: state.sw.elapsedMilliseconds,
-          error: error,
-        ));
-        if (winner.isCompleted) {
-          // Already won/lost; swallow.
-          return;
-        }
-        if (!state.aborted) {
-          _emit(AttemptFailed(
-            host: host,
-            ip: ip.addressString,
-            attemptIndex: idx,
-            error: error,
-            durationMs: state.sw.elapsedMilliseconds,
-          ));
-          _options.logger.log(FailoverLogLevel.warn, 'attempt_failed',
-              fields: <String, Object?>{
-                'host': host,
-                'ip': ip.addressString,
-                'attempt': idx,
-                'hard': hardError,
-                'error': error.toString(),
-              });
-          _cache.markUnavailable(host, ip.address);
-        }
-        if (winner.isCompleted) return;
-        if (_allAttemptsTerminated(attempts) && nextIndex < candidates.length) {
-          // No remaining live attempts; try the next IP now.
-          if (hardError) {
-            failoverTimer?.cancel();
-            failoverTimer = null;
-          }
-          startNextAttempt();
-          _armFailoverTimer();
-        } else if (_allAttemptsTerminated(attempts) &&
-            nextIndex >= candidates.length) {
-          // Exhausted.
-          overall.stop();
-          cancelTimers();
-          _emit(RequestExhausted(
-            host: host,
-            attempts: List<AttemptRecord>.unmodifiable(records),
-            idempotencyKey: idempotencyKey,
-          ));
-          winner.completeError(
-            DioException(
-              requestOptions: requestOptions,
-              type: DioExceptionType.connectionTimeout,
-              error: FailoverExhaustedError(
-                host: host,
-                attempts: List<AttemptRecord>.unmodifiable(records),
-                idempotencyKey: idempotencyKey,
-                overallDurationMs: overall.elapsedMilliseconds,
-              ),
-              message: 'All ${records.length} IP attempts to $host failed',
-            ),
-          );
-        } else if (hardError) {
-          // Live attempts exist OR we have IPs left; on hard error trigger
-          // next now to skip the wait.
-          if (nextIndex < candidates.length) {
-            failoverTimer?.cancel();
-            failoverTimer = null;
-            startNextAttempt();
-            _armFailoverTimer();
-          }
-        }
-      });
-    }
-
-    void armFailoverTimer() {
-      failoverTimer?.cancel();
-      if (nextIndex >= candidates.length) return;
-      if (winner.isCompleted) return;
-      final Duration t = _methodFailoverTimeout(requestOptions, host);
-      failoverTimer = Timer(t, () {
-        if (winner.isCompleted) return;
-        if (nextIndex >= candidates.length) return;
-        startNextAttempt();
-        armFailoverTimer();
-      });
-    }
-
-    _armFailoverTimer = armFailoverTimer;
-
-    // Wire up overall timeout.
-    final Duration deadline = _overallDeadline(requestOptions, host);
-    overallTimer = Timer(deadline, () {
-      if (winner.isCompleted) return;
+    Never throwExhausted() {
       overall.stop();
-      cancelTimers();
-      records.add(AttemptRecord(
-        attemptIndex: -1,
-        ip: lastTriedIp ?? '',
-        outcome: AttemptOutcome.abortedByOverallTimeout,
-        durationMs: overall.elapsedMilliseconds,
-      ));
+      cancelOverallTimer();
       _emit(RequestExhausted(
         host: host,
         attempts: List<AttemptRecord>.unmodifiable(records),
         idempotencyKey: idempotencyKey,
       ));
-      winner.completeError(
-        DioException(
+      throw DioException(
+        requestOptions: requestOptions,
+        type: DioExceptionType.connectionTimeout,
+        error: FailoverExhaustedError(
+          host: host,
+          attempts: List<AttemptRecord>.unmodifiable(records),
+          idempotencyKey: idempotencyKey,
+          overallDurationMs: overall.elapsedMilliseconds,
+        ),
+        message: 'All IP attempts to $host failed',
+      );
+    }
+
+    final Duration deadline = _overallDeadline(requestOptions, host);
+    overallTimer = Timer(deadline, () {
+      if (!httpAbort.isCompleted) httpAbort.complete();
+    });
+
+    if (cancelFuture != null) {
+      cancelSub = cancelFuture.asStream().listen((_) {
+        if (cancelled) return;
+        cancelled = true;
+        if (!httpAbort.isCompleted) httpAbort.complete();
+      });
+    }
+
+    try {
+      while (remaining.isNotEmpty) {
+        if (overall.elapsed >= deadline) {
+          records.add(AttemptRecord(
+            attemptIndex: -1,
+            ip: lastTriedIp ?? '',
+            outcome: AttemptOutcome.abortedByOverallTimeout,
+            durationMs: overall.elapsedMilliseconds,
+          ));
+          _emit(RequestExhausted(
+            host: host,
+            attempts: List<AttemptRecord>.unmodifiable(records),
+            idempotencyKey: idempotencyKey,
+          ));
+          throw DioException(
+            requestOptions: requestOptions,
+            type: DioExceptionType.connectionTimeout,
+            error: FailoverExhaustedError(
+              host: host,
+              attempts: List<AttemptRecord>.unmodifiable(records),
+              idempotencyKey: idempotencyKey,
+              overallDurationMs: overall.elapsedMilliseconds,
+              reason: 'overall_timeout',
+            ),
+            message: 'Overall request timeout (${deadline.inMilliseconds}ms) '
+                'exceeded for $host',
+          );
+        }
+
+        if (cancelled) {
+          overall.stop();
+          records.add(AttemptRecord(
+            attemptIndex: -1,
+            ip: lastTriedIp ?? '',
+            outcome: AttemptOutcome.abortedByCancel,
+            durationMs: overall.elapsedMilliseconds,
+          ));
+          throw DioException.requestCancelled(
+            requestOptions: requestOptions,
+            reason: 'cancelled',
+            stackTrace: StackTrace.current,
+          );
+        }
+
+        final List<IpEntry> batch =
+            remaining.take(parallelWidth).toList(growable: false);
+        if (batch.isEmpty) break;
+
+        if (waveIndex > 0) FailoverMetrics.instance.incFailovers();
+
+        ConnectRaceWinner? raceWinner;
+        final Map<String, int?> connectLatencies = <String, int?>{};
+
+        if (probeEnabled) {
+          try {
+            raceWinner = await connectRace
+                .race(
+              entries: batch,
+              port: port,
+              timeout: _options.probeTimeout,
+              abortFuture: connectAbort,
+              onConnectComplete: (IpEntry entry, int? latencyMs, int order) {
+                connectLatencies[entry.addressString] = latencyMs;
+                _cache.recordLatency(host, entry.address, latencyMs);
+                _emit(LatencyProbed(
+                  host: host,
+                  ip: entry.addressString,
+                  latencyMs: latencyMs,
+                  success: latencyMs != null,
+                  completionOrder: order,
+                ));
+              },
+            )
+                .timeout(
+              _options.probeTimeout + const Duration(milliseconds: 250),
+              onTimeout: () => null,
+            );
+          } on SocketException {
+            if (cancelled) {
+              throw DioException.requestCancelled(
+                requestOptions: requestOptions,
+                reason: 'cancelled',
+                stackTrace: StackTrace.current,
+              );
+            }
+            raceWinner = null;
+          }
+        } else {
+          raceWinner = ConnectRaceWinner(entry: batch.first, connectMs: 0);
+        }
+
+        if (raceWinner == null) {
+          for (final IpEntry e in batch) {
+            _cache.markUnavailable(host, e.address);
+            records.add(AttemptRecord(
+              attemptIndex: waveIndex,
+              ip: e.addressString,
+              outcome: AttemptOutcome.failed,
+              durationMs: connectLatencies[e.addressString] ?? 0,
+              error: const SocketException('TCP connect race failed'),
+            ));
+            _emit(AttemptFailed(
+              host: host,
+              ip: e.addressString,
+              attemptIndex: waveIndex,
+              error: const SocketException('TCP connect race failed'),
+              durationMs: connectLatencies[e.addressString] ?? 0,
+            ));
+          }
+          remaining = remaining.sublist(batch.length);
+          waveIndex++;
+          continue;
+        }
+
+        final IpEntry target = raceWinner.entry;
+        lastTriedIp = target.addressString;
+
+        for (final IpEntry e in batch) {
+          if (e.addressString == target.addressString) continue;
+          final int? ms = connectLatencies[e.addressString];
+          if (ms == null) continue;
+          records.add(AttemptRecord(
+            attemptIndex: waveIndex,
+            ip: e.addressString,
+            outcome: AttemptOutcome.abortedByConnectRace,
+            durationMs: ms,
+          ));
+          _emit(AttemptAborted(
+            host: host,
+            ip: e.addressString,
+            attemptIndex: waveIndex,
+            reason: AttemptOutcome.abortedByConnectRace,
+          ));
+        }
+
+        _emit(AttemptStarted(
+          host: host,
+          ip: target.addressString,
+          attemptIndex: waveIndex,
+          idempotencyKey: idempotencyKey,
+          previousIp: previousIp,
+        ));
+        _options.logger.log(FailoverLogLevel.debug, 'attempt_started',
+            fields: <String, Object?>{
+              'host': host,
+              'ip': target.addressString,
+              'attempt': waveIndex,
+              'idem': idempotencyKey,
+              if (previousIp != null) 'previousIp': previousIp,
+              'connectMs': raceWinner.connectMs,
+            });
+
+        final RequestOptions cloned = _cloneWithHeaders(
+          requestOptions,
+          idempotencyKey: idempotencyKey,
+          previousIp: previousIp,
+          host: host,
+        );
+        final Stream<Uint8List>? freshBody = bodyBytes == null
+            ? null
+            : Stream<Uint8List>.fromIterable(<Uint8List>[bodyBytes]);
+        final IOHttpClientAdapter adapter =
+            _pinnedAdapterFor(host, target.address);
+        final Stopwatch httpSw = Stopwatch()..start();
+
+        try {
+          final ResponseBody body = await adapter.fetch(
+            cloned,
+            freshBody,
+            cancelFuture,
+          );
+          httpSw.stop();
+          records.add(AttemptRecord(
+            attemptIndex: waveIndex,
+            ip: target.addressString,
+            outcome: AttemptOutcome.succeeded,
+            durationMs: httpSw.elapsedMilliseconds,
+            statusCode: body.statusCode,
+          ));
+          _emit(AttemptSucceeded(
+            host: host,
+            ip: target.addressString,
+            attemptIndex: waveIndex,
+            statusCode: body.statusCode,
+            durationMs: httpSw.elapsedMilliseconds,
+          ));
+          _cache.markAvailable(host, target.address);
+          overall.stop();
+          final List<AttemptRecord> sortedRecords =
+              List<AttemptRecord>.of(records)
+                ..sort((AttemptRecord a, AttemptRecord b) =>
+                    a.attemptIndex.compareTo(b.attemptIndex));
+          _annotateResponse(
+            body,
+            host: host,
+            ip: target.addressString,
+            attempts: List<AttemptRecord>.unmodifiable(sortedRecords),
+            idempotencyKey: idempotencyKey,
+            totalMs: overall.elapsedMilliseconds,
+          );
+          return body;
+        } on DioException catch (e) {
+          httpSw.stop();
+          if (CancelToken.isCancel(e)) rethrow;
+          records.add(AttemptRecord(
+            attemptIndex: waveIndex,
+            ip: target.addressString,
+            outcome: AttemptOutcome.failed,
+            durationMs: httpSw.elapsedMilliseconds,
+            error: e,
+          ));
+          _emit(AttemptFailed(
+            host: host,
+            ip: target.addressString,
+            attemptIndex: waveIndex,
+            error: e,
+            durationMs: httpSw.elapsedMilliseconds,
+          ));
+          _cache.markUnavailable(host, target.address);
+          previousIp = target.addressString;
+          remaining.removeWhere(
+            (IpEntry e) => e.addressString == target.addressString,
+          );
+          waveIndex++;
+        } catch (e, s) {
+          httpSw.stop();
+          records.add(AttemptRecord(
+            attemptIndex: waveIndex,
+            ip: target.addressString,
+            outcome: AttemptOutcome.failed,
+            durationMs: httpSw.elapsedMilliseconds,
+            error: e,
+          ));
+          _emit(AttemptFailed(
+            host: host,
+            ip: target.addressString,
+            attemptIndex: waveIndex,
+            error: e,
+            durationMs: httpSw.elapsedMilliseconds,
+          ));
+          _cache.markUnavailable(host, target.address);
+          previousIp = target.addressString;
+          remaining.removeWhere(
+            (IpEntry e) => e.addressString == target.addressString,
+          );
+          waveIndex++;
+          if (e is DioException) rethrow;
+          Error.throwWithStackTrace(e, s);
+        }
+      }
+
+      throwExhausted();
+    } on DioException catch (e) {
+      if (CancelToken.isCancel(e) && cancelled) {
+        records.add(AttemptRecord(
+          attemptIndex: -1,
+          ip: lastTriedIp ?? '',
+          outcome: AttemptOutcome.abortedByCancel,
+          durationMs: overall.elapsedMilliseconds,
+        ));
+      }
+      if (overall.elapsed >= deadline && !CancelToken.isCancel(e)) {
+        records.add(AttemptRecord(
+          attemptIndex: -1,
+          ip: lastTriedIp ?? '',
+          outcome: AttemptOutcome.abortedByOverallTimeout,
+          durationMs: overall.elapsedMilliseconds,
+        ));
+        _emit(RequestExhausted(
+          host: host,
+          attempts: List<AttemptRecord>.unmodifiable(records),
+          idempotencyKey: idempotencyKey,
+        ));
+        throw DioException(
           requestOptions: requestOptions,
           type: DioExceptionType.connectionTimeout,
           error: FailoverExhaustedError(
@@ -648,72 +700,13 @@ class FailoverHttpClientAdapter implements HttpClientAdapter {
           ),
           message: 'Overall request timeout (${deadline.inMilliseconds}ms) '
               'exceeded for $host',
-        ),
-      );
-      unawaited(abortAll(AttemptOutcome.abortedByOverallTimeout));
-    });
-
-    // Wire up outer cancel.
-    if (cancelFuture != null) {
-      cancelSub = cancelFuture.asStream().listen((_) {
-        if (winner.isCompleted) return;
-        overall.stop();
-        cancelTimers();
-        records.add(AttemptRecord(
-          attemptIndex: -1,
-          ip: lastTriedIp ?? '',
-          outcome: AttemptOutcome.abortedByCancel,
-          durationMs: overall.elapsedMilliseconds,
-        ));
-        winner.completeError(
-          DioException.requestCancelled(
-            requestOptions: requestOptions,
-            reason: 'cancelled',
-            stackTrace: StackTrace.current,
-          ),
         );
-        unawaited(abortAll(AttemptOutcome.abortedByCancel));
-      });
-    }
-
-    startNextAttempt();
-    armFailoverTimer();
-
-    try {
-      return await winner.future;
+      }
+      rethrow;
     } finally {
-      cancelTimers();
+      cancelOverallTimer();
       await cancelSub?.cancel();
     }
-  }
-
-  // Late-bound reference so closures inside _runCoordinator can re-arm
-  // the timer from each other without forward-declaration noise.
-  void Function() _armFailoverTimer = () {};
-
-  bool _allAttemptsTerminated(List<_AttemptState> attempts) {
-    for (final _AttemptState a in attempts) {
-      if (!a.completed && !a.aborted) return false;
-    }
-    return true;
-  }
-
-  bool _isHardError(Object e) {
-    if (e is HandshakeException) return true;
-    if (e is TlsException) return true;
-    if (e is SocketException) {
-      final OSError? os = e.osError;
-      if (os == null) return false;
-      // Linux ECONNREFUSED=111, Windows WSAECONNREFUSED=10061,
-      // macOS ECONNREFUSED=61. Also ECONNRESET variants. Treat any error
-      // with a non-zero errno as hard for fast-path purposes.
-      return true;
-    }
-    if (e is DioException) {
-      if (e.type == DioExceptionType.connectionError) return true;
-      if (e.type == DioExceptionType.badCertificate) return true;
-    }
-    return false;
   }
 
   RequestOptions _cloneWithHeaders(
@@ -759,15 +752,7 @@ class FailoverHttpClientAdapter implements HttpClientAdapter {
     }
     if (_options.maxIpAttempts == 1 && _options.enableLatencyProbe) {
       l.log(FailoverLogLevel.warn,
-          'misconfig: maxIpAttempts == 1 makes latency probes wasted work');
-    }
-    final Duration budget = _options.defaultConnectTimeout *
-        _options.maxIpAttempts;
-    if (_options.overallTimeout < budget) {
-      l.log(FailoverLogLevel.warn,
-          'misconfig: overallTimeout (${_options.overallTimeout}) is less '
-          'than maxIpAttempts × defaultConnectTimeout ($budget); '
-          'the fail-over budget will be cut short.');
+          'misconfig: maxIpAttempts == 1 disables parallel connect racing');
     }
     if (_options.maxIpAttempts > 5) {
       l.log(FailoverLogLevel.warn,
@@ -783,19 +768,6 @@ class FailoverHttpClientAdapter implements HttpClientAdapter {
           'maxIpAttempts must be >= 1, got ${_options.maxIpAttempts}');
     }
   }
-}
-
-class _AttemptState {
-  _AttemptState(this.index, this.ip)
-      : abortCompleter = Completer<void>(),
-        sw = Stopwatch()..start();
-
-  final int index;
-  final IpEntry ip;
-  final Completer<void> abortCompleter;
-  final Stopwatch sw;
-  bool completed = false;
-  bool aborted = false;
 }
 
 class _BufferedBody {

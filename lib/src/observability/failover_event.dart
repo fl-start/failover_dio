@@ -43,6 +43,7 @@ final class LatencyProbed extends FailoverEvent {
     required this.ip,
     required this.latencyMs,
     required this.success,
+    this.completionOrder,
   });
 
   /// Normalized hostname the IP belongs to.
@@ -56,6 +57,11 @@ final class LatencyProbed extends FailoverEvent {
 
   /// Whether the probe completed within the budget.
   final bool success;
+
+  /// Finish order in the Happy Eyeballs parallel race (0 = first arrival).
+  ///
+  /// `null` when the probe was not part of a parallel race (legacy path).
+  final int? completionOrder;
 }
 
 /// A per-IP HTTP attempt started.

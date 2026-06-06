@@ -65,10 +65,18 @@ class FakeDnsResolver implements DnsResolver {
 /// Test [LatencyProbe] returning canned latencies.
 class FakeLatencyProbe implements LatencyProbe {
   /// Creates a probe with per-IP [latencies] in ms.
-  FakeLatencyProbe(this.latencies);
+  ///
+  /// Optional [delays] simulate connect time before returning [latencies].
+  FakeLatencyProbe(
+    this.latencies, {
+    this.delays = const <String, Duration>{},
+  });
 
   /// IP string → ms; missing entries probe as null (timeout).
   final Map<String, int?> latencies;
+
+  /// IP string → artificial connect delay before returning.
+  final Map<String, Duration> delays;
 
   /// Each probe call increments this.
   int callCount = 0;
@@ -76,6 +84,10 @@ class FakeLatencyProbe implements LatencyProbe {
   @override
   Future<int?> probe(InternetAddress ip, int port, {Duration? timeout}) async {
     callCount++;
+    final Duration? delay = delays[ip.address];
+    if (delay != null) {
+      await Future<void>.delayed(delay);
+    }
     return latencies[ip.address];
   }
 }

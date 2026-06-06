@@ -146,19 +146,35 @@ void main() {
       expect(events.whereType<RequestExhausted>(), isEmpty);
     });
 
-    test('falls back to second IP when first IP times out', () async {
-      // Bind a second server that delays its response to simulate a slow IP.
-      final HttpServer slow = await HttpServer.bind('127.0.0.1', 0);
-      slow.listen((HttpRequest req) async {
-        await Future<void>.delayed(const Duration(milliseconds: 250));
-        req.response.statusCode = 504;
-        await req.response.close();
-      });
-      addTearDown(() => slow.close(force: true));
+    test('parallel connect race picks reachable IP and sends one HTTP',
+        () async {
+      final FakeDnsResolver dns = FakeDnsResolver(
+        <String, List<String>>{
+          'fake.host.test': <String>['192.0.2.1', '127.0.0.1', '192.0.2.2'],
+        },
+      );
+      final FailoverDio client = FailoverDio(
+        options: BaseOptions(baseUrl: 'http://fake.host.test:$port'),
+        failoverOptions: FailoverOptions(
+          dnsResolver: dns,
+          useSharedCache: false,
+          enableMisconfigWarnings: false,
+          probeTimeout: const Duration(milliseconds: 500),
+          maxIpAttempts: 3,
+          dnsLocalHosts: const <String>{'fake.host.test', 'localhost'},
+        ),
+      );
 
-      // Use a non-routable but resolvable IP for the "slow" target: actually
-      // we want to simulate timeout. Easiest cross-platform approach is to
-      // give the cache an IP that will not connect (TEST-NET-1).
+      final Response<dynamic> res =
+          await client.get<dynamic>('/v1/status');
+      expect(res.statusCode, 200);
+      expect(res.extra[FailoverExtraKeys.winningIp], '127.0.0.1');
+      expect(requestLog, hasLength(1),
+          reason: 'only one HTTP request should hit the server');
+    });
+
+    test('parallel connect race reaches 127.0.0.1 when TEST-NET is slow',
+        () async {
       final FakeDnsResolver dns = FakeDnsResolver(
         <String, List<String>>{
           'fake.host.test': <String>['192.0.2.1', '127.0.0.1'],
@@ -170,41 +186,22 @@ void main() {
         failoverOptions: FailoverOptions(
           dnsResolver: dns,
           useSharedCache: false,
-          enableLatencyProbe: false,
           enableMisconfigWarnings: false,
-          // Short timeouts so the test is fast.
-          getConnectTimeout: const Duration(milliseconds: 300),
-          defaultConnectTimeout: const Duration(milliseconds: 300),
-          overallTimeout: const Duration(seconds: 10),
+          probeTimeout: const Duration(milliseconds: 500),
+          overallTimeout: const Duration(seconds: 5),
+          maxIpAttempts: 2,
           onEvent: events.add,
           dnsLocalHosts: const <String>{'fake.host.test', 'localhost'},
         ),
       );
 
       final Response<dynamic> res =
-          await client.get<dynamic>('/v1/status').timeout(
-                const Duration(seconds: 10),
-              );
+          await client.get<dynamic>('/v1/status');
       expect(res.statusCode, 200);
       expect(res.extra[FailoverExtraKeys.winningIp], '127.0.0.1');
+      expect(requestLog, hasLength(1));
 
-      final List<AttemptRecord> attempts =
-          res.extra[FailoverExtraKeys.attempts] as List<AttemptRecord>;
-      expect(attempts.length, greaterThanOrEqualTo(2));
-      expect(attempts.first.ip, '192.0.2.1');
-      expect(attempts.last.ip, '127.0.0.1');
-      expect(attempts.last.outcome, AttemptOutcome.succeeded);
-
-      // Verify the fallback attempt carried the previous-IP header on the
-      // wire.
-      expect(
-        requestLog.any((s) => s.contains('prev=192.0.2.1')),
-        isTrue,
-        reason: 'expected at least one request with prev=192.0.2.1',
-      );
-
-      // Verify we emitted the expected event types.
-      expect(events.whereType<HostResolved>(), isNotEmpty);
+      expect(events.whereType<LatencyProbed>(), isNotEmpty);
       expect(events.whereType<AttemptStarted>(), isNotEmpty);
       expect(events.whereType<AttemptSucceeded>(), isNotEmpty);
     });
@@ -254,10 +251,8 @@ void main() {
         failoverOptions: FailoverOptions(
           dnsResolver: dns,
           useSharedCache: false,
-          enableLatencyProbe: false,
           enableMisconfigWarnings: false,
-          getConnectTimeout: const Duration(milliseconds: 150),
-          defaultConnectTimeout: const Duration(milliseconds: 150),
+          probeTimeout: const Duration(milliseconds: 150),
           overallTimeout: const Duration(seconds: 5),
           maxIpAttempts: 3,
           dnsLocalHosts: const <String>{'fake.host.test', 'localhost'},
@@ -265,7 +260,9 @@ void main() {
       );
 
       await expectLater(
-        client.get<dynamic>('/v1/status'),
+        client.get<dynamic>('/v1/status').timeout(
+              const Duration(seconds: 3),
+            ),
         throwsA(
           predicate<Object>((Object e) {
             if (e is! DioException) return false;
