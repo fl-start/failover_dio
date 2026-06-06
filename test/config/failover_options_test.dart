@@ -5,9 +5,8 @@ void main() {
   group('FailoverOptions', () {
     test('defaults are sane', () {
       final opts = FailoverOptions();
-      expect(opts.getConnectTimeout, const Duration(seconds: 3));
-      expect(opts.defaultConnectTimeout, const Duration(seconds: 8));
       expect(opts.overallTimeout, const Duration(seconds: 30));
+      expect(opts.probeTimeout, const Duration(seconds: 2));
       expect(opts.maxIpAttempts, 3);
       expect(opts.useSharedCache, isTrue);
       expect(opts.allowPrivateAddresses, isTrue);
@@ -27,25 +26,22 @@ void main() {
 
     test('per-host override returns inherited globals for unset fields', () {
       final opts = FailoverOptions(
-        defaultConnectTimeout: const Duration(seconds: 10),
+        overallTimeout: const Duration(seconds: 10),
         perHost: const <String, HostOverride>{
           'api.internal.example.com': HostOverride(
-            getConnectTimeout: Duration(milliseconds: 500),
+            overallTimeout: Duration(milliseconds: 500),
             maxIpAttempts: 5,
           ),
         },
       );
       // Overridden field
-      expect(opts.getConnectTimeoutFor('api.internal.example.com'),
+      expect(opts.overallTimeoutFor('api.internal.example.com'),
           const Duration(milliseconds: 500));
       // Inherited field
-      expect(opts.defaultConnectTimeoutFor('api.internal.example.com'),
-          const Duration(seconds: 10));
-      // Overridden int
       expect(opts.maxIpAttemptsFor('api.internal.example.com'), 5);
       // Other host gets global defaults
-      expect(opts.getConnectTimeoutFor('cdn.example.com'),
-          const Duration(seconds: 3));
+      expect(opts.overallTimeoutFor('cdn.example.com'),
+          const Duration(seconds: 10));
     });
 
     test('per-host lookup is case-insensitive', () {

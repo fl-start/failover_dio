@@ -146,6 +146,7 @@ Key properties:
 - **Exactly one HTTP request** per logical call — safe for non-idempotent POST/PUT.
 - **Each TCP completion updates cache sort order** immediately, including background completions after the winner is chosen.
 - **Warmup API** (`FailoverDio.warmup`) still uses `ProbeScheduler` for probe-only races without HTTP.
+- **Cold-path double connect**: on the first request (or after cache expiry), the winning IP is connected twice — once for the TCP race (socket closed immediately after timing) and again when HTTP opens a fresh connection via `connectionFactory`. Warm requests with fresh latency rankings skip the race entirely and incur only a single connect.
 
 This is TCP connect time measurement, not ICMP ping — it works on every `dart:io` platform and approximates the real cost of reaching each gateway pod.
 
@@ -247,9 +248,8 @@ cancelToken.cancel('user');
 final dio = Dio(
   options: BaseOptions(baseUrl: 'https://api.example.com'),
   failoverOptions: FailoverOptions(
-    getConnectTimeout: const Duration(seconds: 3),
-    defaultConnectTimeout: const Duration(seconds: 8),
     overallTimeout: const Duration(seconds: 30),
+    probeTimeout: const Duration(seconds: 2),
     maxIpAttempts: 3,
     useSharedCache: true,
     maxCachedHosts: 256,
@@ -265,10 +265,8 @@ final dio = Dio(
 
 | Group | Field | Default | Description |
 |---|---|---|---|
-| Timeouts | `getConnectTimeout` | 3s | Passed through to Dio `Options.connectTimeout` for `GET`/`HEAD` |
-| | `defaultConnectTimeout` | 8s | Passed through to Dio `Options.connectTimeout` for other methods |
-| | `overallTimeout` | 30s | Hard ceiling for the whole logical request |
-| | `probeTimeout` | 2s | Per-IP latency probe timeout |
+| Timeouts | `overallTimeout` | 30s | Hard ceiling for the whole logical request (connect race + HTTP) |
+| | `probeTimeout` | 2s | Per-IP TCP connect race timeout (Happy Eyeballs cold path) |
 | | `dnsLookupTimeout` | 5s | DNS resolver timeout |
 | | `negativeCacheTtl` | 15s | Cache negative lookups for this long |
 | Attempts | `maxIpAttempts` | 3 | Parallel TCP SYN fan-out per wave |
@@ -311,7 +309,7 @@ For one-off tweaks without constructing a new `FailoverOptions`:
 | `failover_dio:max_ip_attempts` | `int` | Override `maxIpAttempts` for this request |
 | `failover_dio:overall_timeout` | `Duration` | Override `overallTimeout` for this request |
 
-Per-request `Options.connectTimeout` is honored as the fail-over trigger for that single request (highest precedence).
+The TCP connect race is bounded by `probeTimeout`. Your own Dio `Options.connectTimeout` and `Options.receiveTimeout` still apply to the HTTP exchange on the winning IP. Per-request `failover_dio:overall_timeout` overrides the library's overall deadline.
 
 ---
 
@@ -322,10 +320,10 @@ Different services often need different SLAs. `HostOverride` lets you tune any f
 ```dart
 final dio = Dio(
   failoverOptions: FailoverOptions(
-    defaultConnectTimeout: const Duration(seconds: 8),
+    overallTimeout: const Duration(seconds: 30),
     perHost: const <String, HostOverride>{
       'api.internal.example.com': HostOverride(
-        getConnectTimeout: Duration(seconds: 1),
+        overallTimeout: Duration(seconds: 5),
         maxIpAttempts: 5,
         allowPrivateAddresses: true,
       ),

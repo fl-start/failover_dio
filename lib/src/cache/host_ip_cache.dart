@@ -221,6 +221,7 @@ class HostIpCache {
     final String h = HostnameNormalizer.normalize(host);
     final HostCacheRow? row = _rows[h];
     if (row == null) return const <IpEntry>[];
+    if (row.entries.length <= 1) return List<IpEntry>.of(row.entries);
     final DateTime now = _clock.now();
     final List<IpEntry> available = <IpEntry>[];
     final List<IpEntry> unavailable = <IpEntry>[];
@@ -230,6 +231,9 @@ class HostIpCache {
       } else {
         available.add(e);
       }
+    }
+    if (available.length <= 1) {
+      return <IpEntry>[...available, ...unavailable];
     }
     // Pre-compute a random tie-break key per entry so the comparator is
     // internally consistent (a stable sort key), while still producing a

@@ -102,12 +102,15 @@ class HappyEyeballsConnectRace {
       });
     }
 
+    bool isRaceFinished() => aborted || done.isCompleted;
+
     for (final IpEntry entry in entries) {
       unawaited(_connectOne(
         entry: entry,
         port: port,
         timeout: timeout,
         tasks: tasks,
+        isRaceFinished: isRaceFinished,
         onSuccess: (ConnectionTask<Socket> task, int ms) {
           recordCompletion(entry, ms);
           if (winner == null && !aborted) {
@@ -138,6 +141,7 @@ class HappyEyeballsConnectRace {
     required int port,
     required Duration timeout,
     required List<ConnectionTask<Socket>> tasks,
+    required bool Function() isRaceFinished,
     required void Function(ConnectionTask<Socket> task, int ms) onSuccess,
     required void Function(int? ms) onFailure,
   }) async {
@@ -146,6 +150,14 @@ class HappyEyeballsConnectRace {
     try {
       task = await Socket.startConnect(entry.address, port);
       tasks.add(task);
+      if (isRaceFinished()) {
+        try {
+          task.cancel();
+        } catch (_) {
+          // Race finished or was aborted while startConnect was awaiting.
+        }
+        return;
+      }
       final Socket socket = await task.socket.timeout(timeout);
       sw.stop();
       final int ms = sw.elapsedMilliseconds;

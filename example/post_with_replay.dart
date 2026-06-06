@@ -11,10 +11,10 @@ Future<void> main() async {
   final Dio dio = Dio(
     options: BaseOptions(baseUrl: 'https://httpbin.org'),
     failoverOptions: FailoverOptions(
-      // Mutating call: give a longer per-IP fail-over trigger.
-      defaultConnectTimeout: const Duration(seconds: 10),
       // Cap how long the whole logical request may take.
       overallTimeout: const Duration(seconds: 25),
+      // Per-IP TCP connect race bound (Happy Eyeballs cold path).
+      probeTimeout: const Duration(seconds: 2),
     ),
   );
 

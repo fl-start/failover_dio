@@ -20,8 +20,6 @@ import 'host_override.dart';
 class FailoverOptions {
   /// Creates options.
   FailoverOptions({
-    this.getConnectTimeout = const Duration(seconds: 3),
-    this.defaultConnectTimeout = const Duration(seconds: 8),
     this.overallTimeout = const Duration(seconds: 30),
     this.maxIpAttempts = 3,
     this.unavailableCooldownInitial = const Duration(seconds: 60),
@@ -70,12 +68,6 @@ class FailoverOptions {
         random = random ?? Random.secure();
 
   // ===== Timeouts and attempts =====
-
-  /// Fail-over trigger for GET/HEAD (default 3s).
-  final Duration getConnectTimeout;
-
-  /// Fail-over trigger for POST/PUT/PATCH/DELETE (default 8s).
-  final Duration defaultConnectTimeout;
 
   /// Hard ceiling for the whole logical request (default 30s).
   final Duration overallTimeout;
@@ -266,14 +258,6 @@ class FailoverOptions {
     return perHost[h];
   }
 
-  /// Returns the effective GET connect timeout for [host].
-  Duration getConnectTimeoutFor(String host) =>
-      overrideFor(host)?.getConnectTimeout ?? getConnectTimeout;
-
-  /// Returns the effective default connect timeout for [host].
-  Duration defaultConnectTimeoutFor(String host) =>
-      overrideFor(host)?.defaultConnectTimeout ?? defaultConnectTimeout;
-
   /// Returns the effective overall timeout for [host].
   Duration overallTimeoutFor(String host) =>
       overrideFor(host)?.overallTimeout ?? overallTimeout;
@@ -308,8 +292,6 @@ class FailoverOptions {
 
   /// Returns a copy with the given fields overridden.
   FailoverOptions copyWith({
-    Duration? getConnectTimeout,
-    Duration? defaultConnectTimeout,
     Duration? overallTimeout,
     int? maxIpAttempts,
     Duration? unavailableCooldownInitial,
@@ -349,9 +331,6 @@ class FailoverOptions {
     Random? random,
   }) {
     return FailoverOptions(
-      getConnectTimeout: getConnectTimeout ?? this.getConnectTimeout,
-      defaultConnectTimeout:
-          defaultConnectTimeout ?? this.defaultConnectTimeout,
       overallTimeout: overallTimeout ?? this.overallTimeout,
       maxIpAttempts: maxIpAttempts ?? this.maxIpAttempts,
       unavailableCooldownInitial:

@@ -5,8 +5,6 @@
 class HostOverride {
   /// Creates an override.
   const HostOverride({
-    this.getConnectTimeout,
-    this.defaultConnectTimeout,
     this.overallTimeout,
     this.maxIpAttempts,
     this.enableLatencyProbe,
@@ -16,12 +14,6 @@ class HostOverride {
     this.latencyBucketMs,
     this.redirectToPeerStatus,
   });
-
-  /// Fail-over trigger for GET/HEAD.
-  final Duration? getConnectTimeout;
-
-  /// Fail-over trigger for all other methods.
-  final Duration? defaultConnectTimeout;
 
   /// Hard ceiling for the whole logical request.
   final Duration? overallTimeout;

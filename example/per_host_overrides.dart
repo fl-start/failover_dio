@@ -8,11 +8,11 @@ import 'package:failover_dio/failover_dio.dart';
 Future<void> main() async {
   final Dio dio = Dio(
     failoverOptions: FailoverOptions(
-      defaultConnectTimeout: const Duration(seconds: 8),
+      overallTimeout: const Duration(seconds: 30),
       maxIpAttempts: 3,
       perHost: const <String, HostOverride>{
         'api.internal.example.com': HostOverride(
-          getConnectTimeout: Duration(seconds: 1),
+          overallTimeout: Duration(seconds: 5),
           maxIpAttempts: 5,
           allowPrivateAddresses: true,
         ),

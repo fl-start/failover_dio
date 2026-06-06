@@ -18,6 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `FakeDnsResolver.withFactory` constructor for testing TTL-expiry topology changes.
 
 ### Changed
+- **Breaking:** Removed unused `FailoverOptions.getConnectTimeout` and `defaultConnectTimeout` (and matching `HostOverride` fields). These were documented as method-specific fail-over triggers but were never applied by the adapter. Per-IP TCP connect racing is bounded by `probeTimeout`; Dio `Options.connectTimeout` / `receiveTimeout` still apply to the HTTP exchange.
+- `overallTimeout` now aborts an **in-flight HTTP fetch**, not just the TCP connect race. Stalled responses that exceed the deadline surface `FailoverExhaustedError(reason: 'overall_timeout')` instead of hanging until the next wave.
+- When every IP returns the configured `redirectToPeerStatus` code, the **last redirect response** is returned to the caller instead of throwing `FailoverExhaustedError`.
+- Idempotency keys are generated lazily (only when headers, events, or response metadata need them).
+- `orderedEntries` short-circuits allocation when there is at most one cached IP or one available IP.
+- IP-literal detection uses `InternetAddress.tryParse` instead of exception-driven parsing.
+- Connect-race tasks created after abort/completion are cancelled immediately to prevent socket leaks.
 - **Breaking:** Multi-IP HTTP failover now uses **parallel TCP Happy Eyeballs connect racing** instead of staggered sequential attempts. Each wave sends up to `maxIpAttempts` concurrent SYNs; the first SYN+ACK wins; losers are RST-cancelled; exactly one HTTP exchange runs on the winner. Waves continue until success or DNS roster exhaustion.
 - `maxIpAttempts` now means **parallel connect fan-out per wave** (not a sequential attempt cap).
 - Request-time connect races populate the latency cache; the pre-HTTP `ProbeScheduler.raceHappyEyeballs` hot-path call was removed (`ProbeScheduler` remains for warmup).

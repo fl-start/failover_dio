@@ -230,12 +230,7 @@ class FailoverHttpClientAdapter implements HttpClientAdapter {
 
   bool _isIpLiteral(String host) {
     if (host.startsWith('[') && host.endsWith(']')) return true;
-    try {
-      InternetAddress(host);
-      return true;
-    } on ArgumentError {
-      return false;
-    }
+    return InternetAddress.tryParse(host) != null;
   }
 
   Future<_BufferedBody> _bufferBody(
@@ -357,8 +352,9 @@ class FailoverHttpClientAdapter implements HttpClientAdapter {
     required int port,
     required int parallelWidth,
   }) async {
-    final String idempotencyKey =
-        _options.idempotencyKeyGenerator.generate();
+    String? cachedIdem;
+    String idem() =>
+        cachedIdem ??= _options.idempotencyKeyGenerator.generate();
     final Stopwatch overall = Stopwatch()..start();
     final List<AttemptRecord> records = <AttemptRecord>[];
     final bool probeEnabled = _options.enableLatencyProbeFor(host);
@@ -370,6 +366,7 @@ class FailoverHttpClientAdapter implements HttpClientAdapter {
     String? lastTriedIp;
 
     final Completer<void> httpAbort = Completer<void>();
+    final Completer<void> deadlineSignal = Completer<void>();
     Timer? overallTimer;
     StreamSubscription<void>? cancelSub;
     bool cancelled = false;
@@ -389,7 +386,7 @@ class FailoverHttpClientAdapter implements HttpClientAdapter {
       _emit(RequestExhausted(
         host: host,
         attempts: List<AttemptRecord>.unmodifiable(records),
-        idempotencyKey: idempotencyKey,
+        idempotencyKey: idem(),
       ));
       throw DioException(
         requestOptions: requestOptions,
@@ -397,7 +394,7 @@ class FailoverHttpClientAdapter implements HttpClientAdapter {
         error: FailoverExhaustedError(
           host: host,
           attempts: List<AttemptRecord>.unmodifiable(records),
-          idempotencyKey: idempotencyKey,
+          idempotencyKey: idem(),
           overallDurationMs: overall.elapsedMilliseconds,
         ),
         message: 'All IP attempts to $host failed',
@@ -407,6 +404,7 @@ class FailoverHttpClientAdapter implements HttpClientAdapter {
     final Duration deadline = _overallDeadline(requestOptions, host);
     overallTimer = Timer(deadline, () {
       if (!httpAbort.isCompleted) httpAbort.complete();
+      if (!deadlineSignal.isCompleted) deadlineSignal.complete();
     });
 
     if (cancelFuture != null) {
@@ -429,7 +427,7 @@ class FailoverHttpClientAdapter implements HttpClientAdapter {
           _emit(RequestExhausted(
             host: host,
             attempts: List<AttemptRecord>.unmodifiable(records),
-            idempotencyKey: idempotencyKey,
+            idempotencyKey: idem(),
           ));
           throw DioException(
             requestOptions: requestOptions,
@@ -437,7 +435,7 @@ class FailoverHttpClientAdapter implements HttpClientAdapter {
             error: FailoverExhaustedError(
               host: host,
               attempts: List<AttemptRecord>.unmodifiable(records),
-              idempotencyKey: idempotencyKey,
+              idempotencyKey: idem(),
               overallDurationMs: overall.elapsedMilliseconds,
               reason: 'overall_timeout',
             ),
@@ -564,7 +562,7 @@ class FailoverHttpClientAdapter implements HttpClientAdapter {
           host: host,
           ip: target.addressString,
           attemptIndex: waveIndex,
-          idempotencyKey: idempotencyKey,
+          idempotencyKey: idem(),
           previousIp: previousIp,
         ));
         _options.logger.log(FailoverLogLevel.debug, 'attempt_started',
@@ -572,14 +570,14 @@ class FailoverHttpClientAdapter implements HttpClientAdapter {
               'host': host,
               'ip': target.addressString,
               'attempt': waveIndex,
-              'idem': idempotencyKey,
+              'idem': idem(),
               if (previousIp != null) 'previousIp': previousIp,
               'connectMs': raceWinner.connectMs,
             });
 
         final RequestOptions cloned = _cloneWithHeaders(
           requestOptions,
-          idempotencyKey: idempotencyKey,
+          idempotencyKey: idem(),
           previousIp: previousIp,
           host: host,
         );
@@ -589,13 +587,19 @@ class FailoverHttpClientAdapter implements HttpClientAdapter {
         final IOHttpClientAdapter adapter =
             _pinnedAdapterFor(host, target.address);
         final Stopwatch httpSw = Stopwatch()..start();
+        final Future<ResponseBody> fetchFuture = adapter.fetch(
+          cloned,
+          freshBody,
+          cancelFuture,
+        );
 
         try {
-          final ResponseBody body = await adapter.fetch(
-            cloned,
-            freshBody,
-            cancelFuture,
-          );
+          final ResponseBody body = await Future.any<ResponseBody>(<Future<ResponseBody>>[
+            fetchFuture,
+            deadlineSignal.future.then<ResponseBody>((_) {
+              throw const _OverallDeadlineExceeded();
+            }),
+          ]);
           httpSw.stop();
 
           // Opt-in "Redirect-To-Peer" failover.  Only fires when:
@@ -631,6 +635,23 @@ class FailoverHttpClientAdapter implements HttpClientAdapter {
             );
             waveIndex++;
             FailoverMetrics.instance.incFailovers();
+            if (remaining.isEmpty) {
+              // Every IP returned redirect-to-peer; return the last response.
+              overall.stop();
+              final List<AttemptRecord> sortedRecords =
+                  List<AttemptRecord>.of(records)
+                    ..sort((AttemptRecord a, AttemptRecord b) =>
+                        a.attemptIndex.compareTo(b.attemptIndex));
+              _annotateResponse(
+                body,
+                host: host,
+                ip: target.addressString,
+                attempts: List<AttemptRecord>.unmodifiable(sortedRecords),
+                idempotencyKey: idem(),
+                totalMs: overall.elapsedMilliseconds,
+              );
+              return body;
+            }
             // Drain the response body to return the connection to the pool.
             unawaited(body.stream.drain<void>().catchError((_) {}));
             continue;
@@ -661,10 +682,42 @@ class FailoverHttpClientAdapter implements HttpClientAdapter {
             host: host,
             ip: target.addressString,
             attempts: List<AttemptRecord>.unmodifiable(sortedRecords),
-            idempotencyKey: idempotencyKey,
+            idempotencyKey: idem(),
             totalMs: overall.elapsedMilliseconds,
           );
           return body;
+        } on _OverallDeadlineExceeded {
+          httpSw.stop();
+          unawaited(
+            fetchFuture
+                .then((ResponseBody b) =>
+                    b.stream.drain<void>().catchError((_) {}))
+                .catchError((_) {}),
+          );
+          records.add(AttemptRecord(
+            attemptIndex: -1,
+            ip: lastTriedIp,
+            outcome: AttemptOutcome.abortedByOverallTimeout,
+            durationMs: overall.elapsedMilliseconds,
+          ));
+          _emit(RequestExhausted(
+            host: host,
+            attempts: List<AttemptRecord>.unmodifiable(records),
+            idempotencyKey: idem(),
+          ));
+          throw DioException(
+            requestOptions: requestOptions,
+            type: DioExceptionType.connectionTimeout,
+            error: FailoverExhaustedError(
+              host: host,
+              attempts: List<AttemptRecord>.unmodifiable(records),
+              idempotencyKey: idem(),
+              overallDurationMs: overall.elapsedMilliseconds,
+              reason: 'overall_timeout',
+            ),
+            message: 'Overall request timeout (${deadline.inMilliseconds}ms) '
+                'exceeded for $host',
+          );
         } on DioException catch (e) {
           httpSw.stop();
           if (CancelToken.isCancel(e)) rethrow;
@@ -735,7 +788,7 @@ class FailoverHttpClientAdapter implements HttpClientAdapter {
         _emit(RequestExhausted(
           host: host,
           attempts: List<AttemptRecord>.unmodifiable(records),
-          idempotencyKey: idempotencyKey,
+          idempotencyKey: idem(),
         ));
         throw DioException(
           requestOptions: requestOptions,
@@ -743,7 +796,7 @@ class FailoverHttpClientAdapter implements HttpClientAdapter {
           error: FailoverExhaustedError(
             host: host,
             attempts: List<AttemptRecord>.unmodifiable(records),
-            idempotencyKey: idempotencyKey,
+            idempotencyKey: idem(),
             overallDurationMs: overall.elapsedMilliseconds,
             reason: 'overall_timeout',
           ),
@@ -795,10 +848,6 @@ class FailoverHttpClientAdapter implements HttpClientAdapter {
     if (_misconfigLogged) return;
     _misconfigLogged = true;
     final FailoverLogger l = _options.logger;
-    if (_options.getConnectTimeout > _options.defaultConnectTimeout) {
-      l.log(FailoverLogLevel.warn,
-          'misconfig: getConnectTimeout > defaultConnectTimeout');
-    }
     if (_options.maxIpAttempts == 1 && _options.enableLatencyProbe) {
       l.log(FailoverLogLevel.warn,
           'misconfig: maxIpAttempts == 1 disables parallel connect racing');
@@ -823,4 +872,9 @@ class _BufferedBody {
   const _BufferedBody({required this.bytes, required this.singleAttempt});
   final Uint8List? bytes;
   final bool singleAttempt;
+}
+
+/// Sentinel thrown when [deadlineSignal] fires during an in-flight HTTP fetch.
+class _OverallDeadlineExceeded implements Exception {
+  const _OverallDeadlineExceeded();
 }

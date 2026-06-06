@@ -219,8 +219,6 @@ void main() {
           useSharedCache: false,
           enableLatencyProbe: false,
           enableMisconfigWarnings: false,
-          getConnectTimeout: const Duration(seconds: 10),
-          defaultConnectTimeout: const Duration(seconds: 10),
           overallTimeout: const Duration(seconds: 30),
           dnsLocalHosts: const <String>{'fake.host.test', 'localhost'},
         ),
@@ -405,6 +403,94 @@ void main() {
       expect(attempts[1].statusCode, 200);
       seenAttempts.addAll(attempts);
       expect(seenAttempts, isNotEmpty);
+    });
+
+    test(
+        'redirectToPeerStatus: returns last redirect response when every IP '
+        'returns the configured code', () async {
+      await server.close(force: true);
+      server = await HttpServer.bind(InternetAddress.anyIPv4, 0);
+      port = server.port;
+      server.listen((HttpRequest req) async {
+        requestLog.add('redirect');
+        req.response.statusCode = 553;
+        req.response.headers.contentType = ContentType.json;
+        req.response.write('{"redirect":true}');
+        await req.response.close();
+      });
+
+      final FakeDnsResolver dns = FakeDnsResolver(
+        <String, List<String>>{
+          'fake.host.test': <String>['127.0.0.1', '127.0.0.2'],
+        },
+      );
+      final FailoverDio client = FailoverDio(
+        options: BaseOptions(baseUrl: 'http://fake.host.test:$port'),
+        failoverOptions: FailoverOptions(
+          dnsResolver: dns,
+          useSharedCache: false,
+          enableLatencyProbe: false,
+          enableMisconfigWarnings: false,
+          maxIpAttempts: 1,
+          redirectToPeerStatus: 553,
+          dnsLocalHosts: const <String>{'fake.host.test', 'localhost'},
+        ),
+      );
+
+      final Response<dynamic> res = await client.get<dynamic>(
+        '/v1/status',
+        options: Options(validateStatus: (_) => true),
+      );
+      expect(res.statusCode, 553);
+      expect(requestLog, hasLength(2));
+      final List<AttemptRecord> attempts =
+          res.extra[FailoverExtraKeys.attempts] as List<AttemptRecord>;
+      expect(attempts, hasLength(2));
+      expect(
+        attempts.every(
+            (AttemptRecord a) => a.outcome == AttemptOutcome.failedOnStatus),
+        isTrue,
+      );
+    });
+
+    test('overallTimeout aborts an in-flight stalled HTTP fetch', () async {
+      await server.close(force: true);
+      server = await HttpServer.bind(InternetAddress.anyIPv4, 0);
+      port = server.port;
+      server.listen((HttpRequest req) async {
+        await Future<void>.delayed(const Duration(seconds: 2));
+        req.response.statusCode = 200;
+        await req.response.close();
+      });
+
+      final FakeDnsResolver dns = FakeDnsResolver(
+        <String, List<String>>{
+          'fake.host.test': <String>['127.0.0.1', '127.0.0.2'],
+        },
+      );
+      final FailoverDio client = FailoverDio(
+        options: BaseOptions(baseUrl: 'http://fake.host.test:$port'),
+        failoverOptions: FailoverOptions(
+          dnsResolver: dns,
+          useSharedCache: false,
+          enableLatencyProbe: false,
+          enableMisconfigWarnings: false,
+          maxIpAttempts: 1,
+          overallTimeout: const Duration(milliseconds: 150),
+          dnsLocalHosts: const <String>{'fake.host.test', 'localhost'},
+        ),
+      );
+
+      await expectLater(
+        client.get<dynamic>('/v1/slow'),
+        throwsA(predicate<Object>((Object e) {
+          if (e is! DioException) return false;
+          if (e.type != DioExceptionType.connectionTimeout) return false;
+          final Object? err = e.error;
+          return err is FailoverExhaustedError &&
+              err.reason == 'overall_timeout';
+        })),
+      );
     });
   });
 }
