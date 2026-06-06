@@ -18,6 +18,10 @@ enum AttemptOutcome {
 
   /// Attempt was abandoned because the overall timeout fired.
   abortedByOverallTimeout,
+
+  /// HTTP response was received but its status code is in
+  /// [FailoverOptions.failoverOnStatus], so the next IP is tried.
+  failedOnStatus,
 }
 
 /// A timed record of one IP attempt, attached to `Response.extra` and to

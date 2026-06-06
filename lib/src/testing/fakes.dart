@@ -32,15 +32,32 @@ class FakeDnsResolver implements DnsResolver {
   /// Creates a resolver with [responses] keyed by hostname (case-insensitive,
   /// trailing-dot safe).
   FakeDnsResolver(
-    this.responses, {
-    this.ttl = const Duration(seconds: 60),
-  });
+    Map<String, List<String>> responses, {
+    Duration ttl = const Duration(seconds: 60),
+  }) : _factory = null,
+       _ttl = ttl,
+       _responses = responses;
+
+  /// Creates a resolver that delegates to [factory] on each call, allowing
+  /// the returned IP list to change between invocations.
+  ///
+  /// Useful for simulating TTL expiry + DNS topology changes in tests.
+  FakeDnsResolver.withFactory(
+    List<String> Function(String host) factory, {
+    Duration ttl = const Duration(milliseconds: 1),
+  }) : _factory = factory,
+       _ttl = ttl,
+       _responses = const <String, List<String>>{};
+
+  final Map<String, List<String>> _responses;
+  final List<String> Function(String host)? _factory;
+  final Duration _ttl;
 
   /// Map of normalized host → list of IP strings.
-  final Map<String, List<String>> responses;
+  Map<String, List<String>> get responses => _responses;
 
   /// TTL returned with every answer.
-  final Duration ttl;
+  Duration get ttl => _ttl;
 
   /// Increments each call; useful for asserting how many times resolve fired.
   int callCount = 0;
@@ -49,15 +66,24 @@ class FakeDnsResolver implements DnsResolver {
   Future<DnsAnswer> resolve(String host) async {
     callCount++;
     final String h = HostnameNormalizer.normalize(host);
-    final List<String>? ips = responses[h];
-    if (ips == null || ips.isEmpty) {
-      throw SocketException('FakeDnsResolver has no entry for $h');
+    final List<String> ips;
+    if (_factory != null) {
+      ips = _factory(h);
+    } else {
+      final List<String>? found = _responses[h];
+      if (found == null || found.isEmpty) {
+        throw SocketException('FakeDnsResolver has no entry for $h');
+      }
+      ips = found;
+    }
+    if (ips.isEmpty) {
+      throw SocketException('FakeDnsResolver returned empty list for $h');
     }
     return DnsAnswer(
       addresses: ips
           .map((String s) => InternetAddress(s))
           .toList(growable: false),
-      ttl: ttl,
+      ttl: _ttl,
     );
   }
 }

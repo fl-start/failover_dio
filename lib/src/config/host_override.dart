@@ -13,6 +13,8 @@ class HostOverride {
     this.allowPrivateAddresses,
     this.enableFailoverHeaders,
     this.singleIpFastPath,
+    this.latencyBucketMs,
+    this.redirectToPeerStatus,
   });
 
   /// Fail-over trigger for GET/HEAD.
@@ -39,4 +41,18 @@ class HostOverride {
   /// Whether to route single-IP DNS results straight to the standard
   /// adapter (no instrumentation) for this host.
   final bool? singleIpFastPath;
+
+  /// Latency quantisation bucket in milliseconds for ranking stability.
+  ///
+  /// Two IPs whose latency falls in the same bucket are treated as equal
+  /// and will be randomly reordered for load distribution. `null` falls
+  /// back to the global [FailoverOptions.latencyBucketMs].
+  final int? latencyBucketMs;
+
+  /// "Redirect-To-Peer" status code for this host.
+  ///
+  /// `null` falls back to [FailoverOptions.redirectToPeerStatus].
+  /// Set to a specific value (e.g. `553`) to override the global setting
+  /// for this host only.
+  final int? redirectToPeerStatus;
 }

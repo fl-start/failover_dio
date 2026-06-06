@@ -211,11 +211,15 @@ class HostIpCache {
   /// Returns the cached entries for [host] ordered by:
   ///
   /// 1. Available entries first (unavailable last).
-  /// 2. Within available, ascending by [IpEntry.latencyMs] (nulls treated
-  ///    as the highest value so probed entries beat unprobed ones).
-  /// 3. Then in DNS answer order for ties.
+  /// 2. Within available, ascending by latency bucket
+  ///    (`latencyMs ~/ latencyBucketMs`). IPs with no latency data sort
+  ///    after all probed entries.
+  /// 3. Within the same bucket, randomly reordered to distribute load
+  ///    across statistically equivalent gateways (matches curl_fo's
+  ///    random tie-break behaviour).
   List<IpEntry> orderedEntries(String host) {
-    final HostCacheRow? row = _rows[HostnameNormalizer.normalize(host)];
+    final String h = HostnameNormalizer.normalize(host);
+    final HostCacheRow? row = _rows[h];
     if (row == null) return const <IpEntry>[];
     final DateTime now = _clock.now();
     final List<IpEntry> available = <IpEntry>[];
@@ -227,15 +231,26 @@ class HostIpCache {
         available.add(e);
       }
     }
+    // Pre-compute a random tie-break key per entry so the comparator is
+    // internally consistent (a stable sort key), while still producing a
+    // different order on each call for within-bucket load distribution.
+    final int bucket = options.latencyBucketMsFor(h).clamp(1, 100000);
+    final Map<IpEntry, int> tieBreak = <IpEntry, int>{
+      for (final IpEntry e in available) e: options.random.nextInt(0x7fffffff),
+    };
     available.sort((IpEntry a, IpEntry b) {
       final int? la = a.latencyMs;
       final int? lb = b.latencyMs;
-      if (la == null && lb == null) return a.dnsOrder.compareTo(b.dnsOrder);
+      if (la == null && lb == null) {
+        return tieBreak[a]!.compareTo(tieBreak[b]!);
+      }
       if (la == null) return 1;
       if (lb == null) return -1;
-      final int byLatency = la.compareTo(lb);
-      if (byLatency != 0) return byLatency;
-      return a.dnsOrder.compareTo(b.dnsOrder);
+      final int ba = la ~/ bucket;
+      final int bb = lb ~/ bucket;
+      if (ba != bb) return ba.compareTo(bb);
+      // Same latency bucket: random load distribution.
+      return tieBreak[a]!.compareTo(tieBreak[b]!);
     });
     return <IpEntry>[...available, ...unavailable];
   }
@@ -243,38 +258,64 @@ class HostIpCache {
   /// Marks [ip] for [host] as unavailable with exponential cooldown.
   ///
   /// Cooldown = `unavailableCooldownInitial * factor ^ consecutiveFailures`,
-  /// clamped to [FailoverOptions.unavailableCooldownMax].
-  void markUnavailable(String host, InternetAddress ip) {
+  /// clamped to [FailoverOptions.unavailableCooldownMax], plus ±10% jitter
+  /// to prevent thundering herd when multiple clients share a cache.
+  ///
+  /// When [transient] is `true` (status-code fail-over, e.g. 502/503/504),
+  /// a shorter fixed cooldown (`unavailableCooldownInitial / 2`) is applied
+  /// without incrementing the consecutive-failure counter. This avoids
+  /// aggressively penalising a gateway that is merely transiently overloaded.
+  void markUnavailable(String host, InternetAddress ip,
+      {bool transient = false}) {
     final HostCacheRow? row = _rows[HostnameNormalizer.normalize(host)];
     if (row == null) return;
     for (final IpEntry e in row.entries) {
       if (e.address == ip || e.address.address == ip.address) {
-        e.consecutiveFailures++;
-        final double seconds = options.unavailableCooldownInitial.inSeconds *
-            _pow(
-              options.unavailableCooldownFactor,
-              e.consecutiveFailures - 1,
-            );
-        final Duration cooldown = Duration(
-          milliseconds: (seconds * 1000).clamp(
-            options.unavailableCooldownInitial.inMilliseconds.toDouble(),
-            options.unavailableCooldownMax.inMilliseconds.toDouble(),
-          ).toInt(),
+        final Duration baseCooldown;
+        if (transient) {
+          // Short fixed cooldown; consecutive-failure counter unchanged.
+          baseCooldown = Duration(
+            microseconds:
+                options.unavailableCooldownInitial.inMicroseconds ~/ 2,
+          );
+        } else {
+          e.consecutiveFailures++;
+          final double seconds =
+              options.unavailableCooldownInitial.inSeconds *
+                  _pow(
+                    options.unavailableCooldownFactor,
+                    e.consecutiveFailures - 1,
+                  );
+          baseCooldown = Duration(
+            milliseconds: (seconds * 1000).clamp(
+              options.unavailableCooldownInitial.inMilliseconds.toDouble(),
+              options.unavailableCooldownMax.inMilliseconds.toDouble(),
+            ).toInt(),
+          );
+        }
+        // ±10% jitter to spread cooldown expiry across clients.
+        final double jitter = 0.9 + options.random.nextDouble() * 0.2;
+        final Duration jittered = Duration(
+          microseconds: (baseCooldown.inMicroseconds * jitter).round(),
         );
-        final DateTime until = _clock.now().add(cooldown);
+        final DateTime until = _clock.now().add(jittered);
         e.unavailableUntil = until;
         _emit(IpMarkedUnavailable(
           host: HostnameNormalizer.normalize(host),
           ip: e.addressString,
           until: until,
         ));
-        _logger.log(FailoverLogLevel.warn, 'ip_marked_unavailable',
-            fields: <String, Object?>{
-              'host': host,
-              'ip': e.addressString,
-              'until': until.toIso8601String(),
-              'failures': e.consecutiveFailures,
-            });
+        _logger.log(
+          transient ? FailoverLogLevel.debug : FailoverLogLevel.warn,
+          'ip_marked_unavailable',
+          fields: <String, Object?>{
+            'host': host,
+            'ip': e.addressString,
+            'until': until.toIso8601String(),
+            'failures': e.consecutiveFailures,
+            'transient': transient,
+          },
+        );
         return;
       }
     }
@@ -399,12 +440,36 @@ class HostIpCache {
         final int ttlMicros = ans.ttl.inMicroseconds;
         final List<String> before =
             target.entries.map((IpEntry e) => e.addressString).toList();
+
+        // TTL-smart re-probe (matches curl_fo behaviour):
+        // Identify the current best IP (lowest latencyMs, non-null) before
+        // merging. If it is still present in the refreshed DNS answer we
+        // keep all existing latency rankings and do not force a re-probe.
+        // If the top IP has left the DNS set (topology change), we clear
+        // lastProbedAt for every entry so ProbeScheduler runs a full
+        // re-probe on the next request.
+        final String? topIpBefore = _topIpAddress(target.entries);
+        final Set<String> newAddressSet = <String>{
+          for (final InternetAddress a in filtered) a.address,
+        };
+        final bool topIpStillPresent =
+            topIpBefore == null || newAddressSet.contains(topIpBefore);
+
         final List<IpEntry> merged = _mergeEntries(
           old: target.entries,
           newAddresses: filtered,
           ttlSeconds: ans.ttl.inSeconds,
           newExpiryMicros: nowMicros + ttlMicros,
         );
+
+        if (!topIpStillPresent) {
+          // Network topology changed: the previously best gateway is gone.
+          // Reset probe freshness so all IPs get re-ranked on next request.
+          for (final IpEntry e in merged) {
+            e.lastProbedAt = null;
+          }
+        }
+
         target.entries = merged;
         target.lastResolvedAt = _clock.now();
         target.lastAccessedAt = target.lastResolvedAt;
@@ -524,6 +589,19 @@ class HostIpCache {
     } catch (_) {
       // Never let an event subscriber crash the cache.
     }
+  }
+
+  /// Returns the address string of the entry with the lowest non-null
+  /// latency in [entries], or `null` if none have been probed yet.
+  String? _topIpAddress(List<IpEntry> entries) {
+    IpEntry? top;
+    for (final IpEntry e in entries) {
+      if (e.latencyMs == null) continue;
+      if (top == null || e.latencyMs! < top.latencyMs!) {
+        top = e;
+      }
+    }
+    return top?.addressString;
   }
 
   /// Computes [base] to the power [exp] where [exp] is a non-negative

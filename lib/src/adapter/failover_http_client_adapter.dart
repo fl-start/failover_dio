@@ -187,6 +187,7 @@ class FailoverHttpClientAdapter implements HttpClientAdapter {
       requestOptions: options,
       allEntries: allEntries,
       bodyBytes: bodyBytes,
+      singleAttemptOnly: singleAttemptOnly,
       cancelFuture: cancelFuture,
       host: host,
       port: port,
@@ -350,6 +351,7 @@ class FailoverHttpClientAdapter implements HttpClientAdapter {
     required RequestOptions requestOptions,
     required List<IpEntry> allEntries,
     required Uint8List? bodyBytes,
+    required bool singleAttemptOnly,
     required Future<void>? cancelFuture,
     required String host,
     required int port,
@@ -468,7 +470,14 @@ class FailoverHttpClientAdapter implements HttpClientAdapter {
         ConnectRaceWinner? raceWinner;
         final Map<String, int?> connectLatencies = <String, int?>{};
 
-        if (probeEnabled) {
+        // Warm-path skip (mirrors curl_fo behaviour): when the batch already
+        // has fresh latency rankings, bypass the TCP connect race entirely and
+        // go straight to HTTP on the top-ranked IP. The race is only needed on
+        // a cold cache (first request) or after topology changes force a re-rank.
+        final bool rankingsFresh =
+            probeEnabled && _probeScheduler.hasFreshLatencyRanking(batch);
+
+        if (probeEnabled && !rankingsFresh) {
           try {
             raceWinner = await connectRace
                 .race(
@@ -503,6 +512,7 @@ class FailoverHttpClientAdapter implements HttpClientAdapter {
             raceWinner = null;
           }
         } else {
+          // Either probing is disabled or rankings are warm: use top of batch.
           raceWinner = ConnectRaceWinner(entry: batch.first, connectMs: 0);
         }
 
@@ -587,6 +597,45 @@ class FailoverHttpClientAdapter implements HttpClientAdapter {
             cancelFuture,
           );
           httpSw.stop();
+
+          // Opt-in "Redirect-To-Peer" failover.  Only fires when:
+          //  1. redirectToPeerStatus is configured (non-null), AND
+          //  2. the response status exactly matches that code, AND
+          //  3. the request body can still be replayed (!singleAttemptOnly).
+          // All other HTTP responses — including standard 4xx and 5xx — are
+          // returned to the caller immediately without retrying a different IP.
+          final int? redirectCode =
+              _options.redirectToPeerStatusFor(host);
+          if (!singleAttemptOnly &&
+              redirectCode != null &&
+              body.statusCode == redirectCode) {
+            records.add(AttemptRecord(
+              attemptIndex: waveIndex,
+              ip: target.addressString,
+              outcome: AttemptOutcome.failedOnStatus,
+              durationMs: httpSw.elapsedMilliseconds,
+              statusCode: body.statusCode,
+            ));
+            _emit(AttemptFailed(
+              host: host,
+              ip: target.addressString,
+              attemptIndex: waveIndex,
+              error: Exception('HTTP ${body.statusCode} triggers failover'),
+              durationMs: httpSw.elapsedMilliseconds,
+            ));
+            // Short transient cooldown; consecutive-failure counter unchanged.
+            _cache.markUnavailable(host, target.address, transient: true);
+            previousIp = target.addressString;
+            remaining.removeWhere(
+              (IpEntry e) => e.addressString == target.addressString,
+            );
+            waveIndex++;
+            FailoverMetrics.instance.incFailovers();
+            // Drain the response body to return the connection to the pool.
+            unawaited(body.stream.drain<void>().catchError((_) {}));
+            continue;
+          }
+
           records.add(AttemptRecord(
             attemptIndex: waveIndex,
             ip: target.addressString,

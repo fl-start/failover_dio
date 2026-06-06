@@ -293,6 +293,119 @@ void main() {
       await client.get<dynamic>('/v1/status');
       expect(dns.callCount, 1);
     });
+
+    // ── Warm-path skip (improvement 1) ──────────────────────────────────
+
+    test('warm-path skip: second request emits no LatencyProbed events when '
+        'rankings are fresh (improvement 1)', () async {
+      // Two IPs: 192.0.2.1 (unreachable) and 127.0.0.1 (reachable).
+      // First request: cold → TCP race runs → both IPs call onConnectComplete.
+      // Second request: 127.0.0.1 has fresh latency → warm-path skip → no race.
+      final FakeDnsResolver dns = FakeDnsResolver(
+        <String, List<String>>{
+          'fake.host.test': <String>['192.0.2.1', '127.0.0.1'],
+        },
+      );
+      final List<LatencyProbed> probeEvents = <LatencyProbed>[];
+      final FailoverDio client = FailoverDio(
+        options: BaseOptions(baseUrl: 'http://fake.host.test:$port'),
+        failoverOptions: FailoverOptions(
+          dnsResolver: dns,
+          useSharedCache: false,
+          enableMisconfigWarnings: false,
+          probeTimeout: const Duration(milliseconds: 400),
+          overallTimeout: const Duration(seconds: 5),
+          maxIpAttempts: 2,
+          // Long freshness window: second request definitely sees stale=false.
+          probeFreshness: const Duration(seconds: 60),
+          onEvent: (FailoverEvent e) {
+            if (e is LatencyProbed) probeEvents.add(e);
+          },
+          dnsLocalHosts: const <String>{'fake.host.test', 'localhost'},
+        ),
+      );
+
+      // First request: cold path → TCP race should fire.
+      await client.get<dynamic>('/v1/status');
+      final int probesAfterFirst = probeEvents.length;
+      expect(probesAfterFirst, greaterThan(0),
+          reason: 'first (cold) request must run TCP race');
+
+      probeEvents.clear();
+
+      // Second request: warm path → TCP race must be skipped.
+      await client.get<dynamic>('/v1/status');
+      expect(probeEvents, isEmpty,
+          reason: 'second (warm) request must skip TCP race when rankings '
+              'are fresh (improvement 1)');
+    });
+
+    // ── Redirect-To-Peer failover (improvement 4) ────────────────────────
+
+    test(
+        'redirectToPeerStatus: retries next IP when server returns the '
+        'configured "Redirect-To-Peer" code (improvement 4)', () async {
+      // Override the server to return 553 on the first connection,
+      // 200 on the second. Bind to all interfaces so that connections
+      // to 127.0.0.1 and 127.0.0.2 (both loopback) both reach this server.
+      await server.close(force: true);
+      int reqIndex = 0;
+      server = await HttpServer.bind(InternetAddress.anyIPv4, 0);
+      port = server.port;
+      server.listen((HttpRequest req) async {
+        reqIndex++;
+        requestLog.add('req#$reqIndex');
+        req.response.statusCode = reqIndex == 1 ? 553 : 200;
+        req.response.headers.contentType = ContentType.json;
+        req.response.write('{"ok":${reqIndex != 1}}');
+        await req.response.close();
+      });
+
+      // Two loopback IPs; serial waves (maxIpAttempts: 1) for predictability.
+      final FakeDnsResolver dns = FakeDnsResolver(
+        <String, List<String>>{
+          'fake.host.test': <String>['127.0.0.1', '127.0.0.2'],
+        },
+      );
+      final List<AttemptRecord> seenAttempts = <AttemptRecord>[];
+      final FailoverDio client = FailoverDio(
+        options: BaseOptions(baseUrl: 'http://fake.host.test:$port'),
+        failoverOptions: FailoverOptions(
+          dnsResolver: dns,
+          useSharedCache: false,
+          enableLatencyProbe: false,
+          enableMisconfigWarnings: false,
+          maxIpAttempts: 1,
+          // Opt in to Redirect-To-Peer failover for status code 553.
+          redirectToPeerStatus: 553,
+          onEvent: (FailoverEvent e) {
+            if (e is AttemptSucceeded || e is AttemptFailed) {
+              // Capture via Response.extra after the call.
+            }
+          },
+          dnsLocalHosts: const <String>{'fake.host.test', 'localhost'},
+        ),
+      );
+
+      final Response<dynamic> res = await client.get<dynamic>('/v1/status');
+      expect(res.statusCode, 200,
+          reason: 'final response must be the 200 from the second IP');
+
+      // Two HTTP requests hit the server (one 502, one 200).
+      expect(requestLog, hasLength(2),
+          reason: 'two distinct HTTP requests must have been sent');
+
+      // Attempt records: first attempt failedOnStatus, second succeeded.
+      final List<AttemptRecord> attempts =
+          res.extra[FailoverExtraKeys.attempts] as List<AttemptRecord>;
+      expect(attempts, hasLength(2));
+      expect(attempts[0].outcome, AttemptOutcome.failedOnStatus);
+      expect(attempts[0].statusCode, 553);
+      expect(attempts[1].outcome, AttemptOutcome.succeeded);
+      expect(attempts[1].statusCode, 200);
+      seenAttempts.addAll(attempts);
+      expect(seenAttempts, isNotEmpty);
+    });
   });
 }
 

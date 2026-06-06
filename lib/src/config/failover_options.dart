@@ -39,6 +39,8 @@ class FailoverOptions {
     this.maxStaleAge = const Duration(seconds: 60),
     this.enableFailoverHeaders = true,
     this.singleIpFastPath = true,
+    this.latencyBucketMs = 10,
+    this.redirectToPeerStatus,
     IdempotencyKeyGenerator? idempotencyKeyGenerator,
     BodyReplayPolicy? bodyReplay,
     DnsResolver? dnsResolver,
@@ -151,6 +153,48 @@ class FailoverOptions {
   /// Defaults to `true`.
   final bool singleIpFastPath;
 
+  /// Latency quantisation bucket in milliseconds (default 10).
+  ///
+  /// IPs whose measured latency falls in the same bucket (i.e.
+  /// `latencyMs ~/ latencyBucketMs` is equal) are considered equivalent
+  /// and randomly shuffled. This prevents microvariance (e.g. 12 ms vs
+  /// 14 ms) from causing constant ranking churn, and distributes load
+  /// across statistically equivalent gateways.
+  ///
+  /// Set to `1` to disable bucketing and use exact millisecond values.
+  final int latencyBucketMs;
+
+  /// HTTP status code emitted by a gateway to signal "try another peer"
+  /// (default `null` — only transport failures trigger fail-over).
+  ///
+  /// When `null` (the default), **every** HTTP response — including any
+  /// 4xx or 5xx — is returned to the caller immediately without retrying a
+  /// different IP. This is the correct default for standard deployments: HTTP
+  /// error codes represent application-layer decisions that the gateway made
+  /// deliberately, not transport failures.
+  ///
+  /// Set this to a specific status code that your API-gateway infrastructure
+  /// uses to signal "this instance cannot serve the request, try a peer". A
+  /// common convention is **553** (outside the IANA-assigned 5xx range, so
+  /// it cannot be confused with standard server errors):
+  ///
+  /// ```dart
+  /// FailoverOptions(redirectToPeerStatus: 553)
+  /// ```
+  ///
+  /// When a response with this exact status code is received:
+  /// - The IP is placed in a short transient cooldown
+  ///   (`unavailableCooldownInitial / 2`) without incrementing the
+  ///   consecutive-failure counter.
+  /// - The next ranked IP is attempted.
+  /// - Fail-over is only applied when the request body can be replayed.
+  ///   Non-replayable stream bodies will still return the response
+  ///   immediately.
+  ///
+  /// All other HTTP responses (1xx–4xx and remaining 5xx) are returned to
+  /// the caller without any retry.
+  final int? redirectToPeerStatus;
+
   /// Source of per-request idempotency keys.
   final IdempotencyKeyGenerator idempotencyKeyGenerator;
 
@@ -254,6 +298,14 @@ class FailoverOptions {
   bool singleIpFastPathFor(String host) =>
       overrideFor(host)?.singleIpFastPath ?? singleIpFastPath;
 
+  /// Returns the effective `latencyBucketMs` for [host].
+  int latencyBucketMsFor(String host) =>
+      overrideFor(host)?.latencyBucketMs ?? latencyBucketMs;
+
+  /// Returns the effective `redirectToPeerStatus` for [host].
+  int? redirectToPeerStatusFor(String host) =>
+      overrideFor(host)?.redirectToPeerStatus ?? redirectToPeerStatus;
+
   /// Returns a copy with the given fields overridden.
   FailoverOptions copyWith({
     Duration? getConnectTimeout,
@@ -275,6 +327,10 @@ class FailoverOptions {
     Duration? maxStaleAge,
     bool? enableFailoverHeaders,
     bool? singleIpFastPath,
+    int? latencyBucketMs,
+    // Use _Unset sentinel so callers can explicitly pass null to clear the
+    // redirectToPeerStatus (setting int? via ?? would be ambiguous).
+    Object? redirectToPeerStatus = const _Unset(),
     IdempotencyKeyGenerator? idempotencyKeyGenerator,
     BodyReplayPolicy? bodyReplay,
     DnsResolver? dnsResolver,
@@ -317,6 +373,10 @@ class FailoverOptions {
       enableFailoverHeaders:
           enableFailoverHeaders ?? this.enableFailoverHeaders,
       singleIpFastPath: singleIpFastPath ?? this.singleIpFastPath,
+      latencyBucketMs: latencyBucketMs ?? this.latencyBucketMs,
+      redirectToPeerStatus: redirectToPeerStatus is _Unset
+          ? this.redirectToPeerStatus
+          : redirectToPeerStatus as int?,
       idempotencyKeyGenerator:
           idempotencyKeyGenerator ?? this.idempotencyKeyGenerator,
       bodyReplay: bodyReplay ?? this.bodyReplay,
@@ -351,4 +411,11 @@ class FailoverOptions {
     }
     return const ConsoleFailoverLogger(minLevel: FailoverLogLevel.warn);
   }
+}
+
+/// Private sentinel used by [FailoverOptions.copyWith] to distinguish between
+/// "caller did not pass redirectToPeerStatus" and "caller explicitly passed
+/// null" (which clears a previously set code).
+class _Unset {
+  const _Unset();
 }

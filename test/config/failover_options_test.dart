@@ -13,6 +13,9 @@ void main() {
       expect(opts.allowPrivateAddresses, isTrue);
       expect(opts.enableLatencyProbe, isTrue);
       expect(opts.enableFailoverHeaders, isTrue);
+      // New defaults.
+      expect(opts.latencyBucketMs, 10);
+      expect(opts.redirectToPeerStatus, isNull);
     });
 
     test('copyWith overrides only set fields', () {
@@ -53,6 +56,42 @@ void main() {
       );
       expect(opts.maxIpAttemptsFor('API.Example.COM'), 7);
       expect(opts.maxIpAttemptsFor('api.example.com.'), 7);
+    });
+
+    test('copyWith preserves new fields when not overridden', () {
+      final opts = FailoverOptions(
+        latencyBucketMs: 25,
+        redirectToPeerStatus: 553,
+      );
+      final copy = opts.copyWith(maxIpAttempts: 5);
+      expect(copy.latencyBucketMs, 25);
+      expect(copy.redirectToPeerStatus, 553);
+    });
+
+    test('copyWith can clear redirectToPeerStatus by passing null', () {
+      final opts = FailoverOptions(redirectToPeerStatus: 553);
+      final copy = opts.copyWith(redirectToPeerStatus: null);
+      expect(copy.redirectToPeerStatus, isNull);
+    });
+
+    test(
+        'per-host override applies latencyBucketMs and redirectToPeerStatus',
+        () {
+      final opts = FailoverOptions(
+        latencyBucketMs: 10,
+        perHost: const <String, HostOverride>{
+          'gateway.example.com': HostOverride(
+            latencyBucketMs: 50,
+            redirectToPeerStatus: 553,
+          ),
+        },
+      );
+      // Override values for the specific host.
+      expect(opts.latencyBucketMsFor('gateway.example.com'), 50);
+      expect(opts.redirectToPeerStatusFor('gateway.example.com'), 553);
+      // Global defaults for other hosts.
+      expect(opts.latencyBucketMsFor('other.example.com'), 10);
+      expect(opts.redirectToPeerStatusFor('other.example.com'), isNull);
     });
   });
 }
